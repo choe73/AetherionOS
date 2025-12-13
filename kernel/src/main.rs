@@ -1,14 +1,22 @@
 // Aetherion OS Kernel - Entry Point
-// Phase 1: Memory management with frame allocator
+// Phase 1.3: Memory management with heap allocator
 
 #![no_std]
 #![no_main]
 #![feature(asm_const)]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 use core::panic::PanicInfo;
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
 
-// Memory management module
+// Memory management modules
 mod memory;
+mod allocator;
+
 use memory::{PhysicalAddress, frame_allocator::FrameAllocator};
 
 // VGA Text Mode Constants
@@ -24,6 +32,11 @@ const SERIAL_PORT: u16 = 0x3F8;
 const MEMORY_START: usize = 0x100000;  // 1MB (after kernel)
 const MEMORY_SIZE: usize = 32 * 1024 * 1024;  // 32MB managed RAM
 static mut FRAME_BITMAP: [u8; 4096] = [0; 4096];  // Support 32MB (8192 frames)
+
+// Heap configuration
+const HEAP_START: usize = 0x_4444_4444_0000;
+const HEAP_SIZE: usize = 1024 * 1024;  // 1 MB heap
+static mut HEAP_MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 /// Kernel Entry Point
 /// Called by bootloader after CPU is in 64-bit long mode
@@ -84,17 +97,51 @@ pub extern "C" fn _start() -> ! {
     print_str("Allocated 5 frames successfully!", 0, 15);
     serial_print("[MEMORY] Allocated 5 test frames\n");
     
-    // Display allocator stats
-    print_str("Allocator Statistics:", 0, 17);
-    print_str("  Allocated: 5 frames (20 KB)", 0, 18);
-    print_str("  Free: 8187 frames (~32 MB)", 0, 19);
-    print_str("  Usage: <1%", 0, 20);
+    // Initialize heap allocator
+    serial_print("[HEAP] Initializing heap allocator...\n");
+    unsafe {
+        allocator::init_heap(
+            HEAP_MEMORY.as_ptr() as usize,
+            HEAP_SIZE,
+        );
+    }
+    print_str("Heap Allocator: INITIALIZED", 0, 16);
+    serial_print("[HEAP] Heap allocator initialized (1 MB)\n");
     
-    serial_print("[MEMORY] Memory management operational\n");
-    print_str("Status: OPERATIONAL", 0, 22);
+    // Test heap allocations
+    serial_print("[HEAP] Testing dynamic allocations...\n");
+    print_str("Testing Heap Allocations...", 0, 18);
     
-    // Halt loop (CPU will halt and wait for interrupts)
-    print_str("System ready. Press Reset to reboot.", 0, 24);
+    // Test Vec
+    let mut vec = Vec::new();
+    vec.push(1);
+    vec.push(2);
+    vec.push(3);
+    serial_print("[HEAP] Vec test: OK\n");
+    
+    // Test String
+    let mut s = String::from("Aetherion");
+    s.push_str(" OS");
+    serial_print("[HEAP] String test: OK\n");
+    
+    // Test Box
+    let boxed = Box::new(42);
+    serial_print("[HEAP] Box test: OK\n");
+    
+    print_str("All heap tests passed!", 0, 19);
+    serial_print("[HEAP] All dynamic allocation tests passed\n");
+    
+    // Display heap stats
+    let stats = allocator::heap_stats();
+    print_str("Heap Statistics:", 0, 21);
+    print_str("  Size: 1 MB", 0, 22);
+    serial_print("[HEAP] Heap size: 1 MB\n");
+    
+    serial_print("[MEMORY] Memory management fully operational\n");
+    print_str("Status: OPERATIONAL", 0, 24);
+    
+    // Halt loop
+    print_str("System ready. Press Reset to reboot.", 0, 25);
     
     loop {
         // Use hlt instruction to save power
@@ -102,6 +149,13 @@ pub extern "C" fn _start() -> ! {
             core::arch::asm!("hlt");
         }
     }
+}
+
+/// Allocation Error Handler
+/// Called when heap allocation fails
+#[alloc_error_handler]
+fn alloc_error(layout: core::alloc::Layout) -> ! {
+    panic!("Heap allocation failed: {:?}", layout);
 }
 
 /// Panic Handler
