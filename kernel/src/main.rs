@@ -16,6 +16,9 @@ use alloc::boxed::Box;
 // Memory management modules
 mod memory;
 mod allocator;
+mod gdt;
+mod interrupts;
+mod syscall;
 
 use memory::{PhysicalAddress, frame_allocator::FrameAllocator};
 
@@ -47,11 +50,29 @@ pub extern "C" fn _start() -> ! {
     clear_screen();
     
     // Display boot message
-    print_str("AETHERION OS v0.1.0 - Phase 1", 0, 0);
+    print_str("AETHERION OS v0.2.0 - Phase 2", 0, 0);
     print_str("================================", 0, 1);
     print_str("Kernel loaded successfully!", 0, 3);
-    print_str("Phase 1: Memory Management", 0, 4);
+    print_str("Phase 2: Interrupts & Syscalls", 0, 4);
     print_str("Status: INITIALIZING...", 0, 5);
+    
+    // Initialize GDT
+    serial_print("[CPU] Initializing GDT...\n");
+    gdt::init();
+    print_str("GDT: INITIALIZED", 0, 6);
+    serial_print("[CPU] GDT initialized\n");
+    
+    // Initialize IDT
+    serial_print("[CPU] Initializing IDT...\n");
+    interrupts::init();
+    print_str("IDT: INITIALIZED", 0, 7);
+    serial_print("[CPU] IDT initialized\n");
+    
+    // Initialize syscalls
+    serial_print("[SYSCALL] Initializing syscall interface...\n");
+    syscall::init();
+    print_str("Syscalls: INITIALIZED", 0, 8);
+    serial_print("[SYSCALL] Syscall interface ready\n");
     
     // Log to serial
     serial_print("[KERNEL] Aetherion OS booted successfully\n");
