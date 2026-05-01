@@ -41,3 +41,30 @@ benchmark_results/
 # Temporary files
 tmp/
 temp/
+*.tar.gz
+*.tar.xz
+disk.img
+*.img
+*.gguf
+/tmp/part_*
+mistral_part_*
+*.gguf
+micro_model*
+*/target
+userspace/agent_mcp/target/
+userspace/agent_validator/target/
+userspace/agent_mcp/target/
+userspace/agent_validator/target/
+
+# Shared agent build target (compiled std libs)
+.agent_target/
+
+# Binary cache (agent ELFs)
+bin_cache/
+
+disk.img
+models/
+/tmp/
+.agent_target/
+third_party/
+.github/workflows/build.yml

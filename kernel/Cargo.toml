@@ -1,23 +1,51 @@
 [package]
 name = "aetherion-kernel"
-version = "0.0.1"
+version = "0.9.0"
 edition = "2021"
-authors = ["Cabrel Foka <cabrel@aetherion.dev>"]
+authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
 license = "MIT"
-description = "Aetherion OS Kernel - A next-generation OS written in Rust"
+description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stub"
 
 [dependencies]
-# Phase 1.3: Heap allocator dependencies
+
+# Bootloader API 0.11 — kernel-side types (BootInfo, entry_point! macro)
+# The actual bootloader binary is built via the boot/ crate
+bootloader_api = "0.11"
+
+# Serial port for debug
+uart_16550 = "0.2"
+
+# Spin mutex (no_std)
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
-[profile.dev]
-panic = "abort"
+# Lazy static for initialization
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
-[profile.release]
-panic = "abort"
-lto = true         # Link Time Optimization
-opt-level = 2      # Optimize for size and speed
-codegen-units = 1  # Better optimization, slower compile
+# x86_64 architecture support - GDT, IDT, TSS
+# Upgraded to 0.15.4 for nightly-2026 compatibility (Step trait change)
+x86_64 = "0.15.4"
 
-[profile.test]
-panic = "unwind"   # Allow panics in tests
+# PIC 8259 Programmable Interrupt Controller
+pic8259 = "0.10.4"
+
+# SHA256 for TPM PCR measurements (no_std, force-soft for compatibility)
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+# ArrayString for macros (no_std)
+arrayvec = { version = "0.7", default-features = false }
+
+# Heap allocator for alloc (Box, Vec)
+linked_list_allocator = "0.10.5"
+
+# Cognitive Bus - Lock-free MPMC queue (no_std compatible)
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# Limine boot protocol (optional, for Limine boot path)
+limine = { version = "0.6", optional = true }
+
+[features]
+default = []
+limine = ["dep:limine"]
+
+# Profiles are defined in workspace root Cargo.toml
+# [package.metadata.bootloader] removed — config now in boot/ crate BootloaderConfig

@@ -1,0 +1,323 @@
+/*
+ * libc_stub.c - Minimal libc implementation for AetherionOS
+ *
+ * All I/O goes through the SYSCALL instruction to the AetherionOS kernel.
+ * This file is compiled with -nostdlib -fno-builtin to create bare-metal
+ * C programs that run in Ring 3 user space.
+ *
+ * Copyright (c) 2024-2026 MORNINGSTAR / AetherionOS Project
+ */
+
+#include "libc_stub.h"
+
+/* ========================================
+ * Syscall primitives (GCC inline assembly)
+ * Uses the Linux x86_64 syscall ABI:
+ *   RAX = syscall number
+ *   RDI = arg1, RSI = arg2, RDX = arg3
+ *   R10 = arg4, R8 = arg5, R9 = arg6
+ *   SYSCALL instruction
+ *   Return value in RAX
+ * ======================================== */
+
+long syscall1(long n, long a1) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a1)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+long syscall2(long n, long a1, long a2) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+long syscall3(long n, long a1, long a2, long a3) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+long syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long ret;
+    register long r10 asm("r10") = a4;
+    register long r8  asm("r8")  = a5;
+    register long r9  asm("r9")  = a6;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+/* ========================================
+ * POSIX-like wrappers
+ * ======================================== */
+
+ssize_t write(int fd, const void *buf, size_t count) {
+    return (ssize_t)syscall3(1, (long)fd, (long)buf, (long)count);
+}
+
+ssize_t read(int fd, void *buf, size_t count) {
+    return (ssize_t)syscall3(0, (long)fd, (long)buf, (long)count);
+}
+
+void exit(int status) {
+    syscall2(60, (long)status, 0);
+    /* Unreachable - loop forever if syscall somehow returns */
+    while(1) { asm volatile("hlt"); }
+}
+
+long getpid(void) {
+    return syscall1(20, 0);
+}
+
+/* ========================================
+ * AetherionOS extensions
+ * ======================================== */
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    return (void *)syscall6(9, (long)addr, (long)len, (long)prot,
+                            (long)flags, (long)fd, (long)offset);
+}
+
+long bus_publish(long intent, int priority, long data) {
+    return syscall3(201, intent, (long)priority, data);
+}
+
+long vga_write(int row, int col, long color_char) {
+    return syscall3(202, (long)row, (long)col, color_char);
+}
+
+/* ========================================
+ * String utilities
+ * ======================================== */
+
+size_t strlen(const char *s) {
+    size_t len = 0;
+    while (s[len] != '\0') len++;
+    return len;
+}
+
+void *memset(void *s, int c, size_t n) {
+    unsigned char *p = (unsigned char *)s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+void *memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
+    return *(unsigned char *)s1 - *(unsigned char *)s2;
+}
+
+/* Integer to ASCII (base 10) */
+int itoa(long value, char *buf, int bufsize) {
+    char tmp[24];
+    int i = 0, neg = 0;
+
+    if (value < 0) { neg = 1; value = -value; }
+    if (value == 0) { tmp[i++] = '0'; }
+    else {
+        while (value > 0 && i < 22) {
+            tmp[i++] = '0' + (value % 10);
+            value /= 10;
+        }
+    }
+
+    int len = i + neg;
+    if (len >= bufsize) return -1;
+
+    int pos = 0;
+    if (neg) buf[pos++] = '-';
+    while (i > 0) buf[pos++] = tmp[--i];
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* Print a string to stdout */
+void puts(const char *s) {
+    write(1, s, strlen(s));
+}
+
+/* Print an integer to stdout */
+void print_int(long val) {
+    char buf[24];
+    itoa(val, buf, sizeof(buf));
+    puts(buf);
+}
+
+/* Print unsigned long in hex */
+void print_hex(unsigned long val) {
+    const char hex[] = "0123456789ABCDEF";
+    char buf[19]; /* "0x" + 16 digits + '\0' */
+    buf[0] = '0';
+    buf[1] = 'x';
+    int i;
+    for (i = 0; i < 16; i++) {
+        buf[2 + i] = hex[(val >> (60 - i * 4)) & 0xF];
+    }
+    buf[18] = '\0';
+    puts(buf);
+}
+
+/* ========================================
+ * Network syscalls (Couche 17+18)
+ * ======================================== */
+
+/* ICMP ping: syscall 210 */
+long net_ping(int a, int b, int c, int d, int seq) {
+    unsigned long ip = pack_ip(a, b, c, d);
+    return syscall2(210, (long)ip, (long)seq);
+}
+
+/* TCP connect: use standard Linux connect(fd, sockaddr*, addrlen=16).
+ * Build a sockaddr_in { sa_family=AF_INET(2), sin_port=BE, sin_addr=BE } on stack
+ * and pass its address to syscall 42 = connect(fd, addr_ptr, 16). */
+long tcp_connect(int fd, int a, int b, int c, int d, int port) {
+    unsigned char sa[16];
+    memset(sa, 0, 16);
+    sa[0] = 2; sa[1] = 0;  /* AF_INET = 2 (little-endian u16) */
+    sa[2] = (unsigned char)((port >> 8) & 0xFF);  /* sin_port high byte (big-endian) */
+    sa[3] = (unsigned char)(port & 0xFF);          /* sin_port low byte */
+    sa[4] = (unsigned char)a;  /* sin_addr byte 0 */
+    sa[5] = (unsigned char)b;  /* sin_addr byte 1 */
+    sa[6] = (unsigned char)c;  /* sin_addr byte 2 */
+    sa[7] = (unsigned char)d;  /* sin_addr byte 3 */
+    return syscall3(42, (long)fd, (long)sa, 16);
+}
+
+/* TCP send: use sendto(fd, buf, len, 0, NULL, 0) on connected socket.
+ * syscall 44 = sendto: a1=fd, a2=buf, a3=len, a4=flags, a5=dest_addr, a6=addrlen
+ * With dest_addr=NULL and addrlen=0, kernel routes to tcp_send on connected socket. */
+long tcp_send(int fd, const void *buf, size_t len) {
+    return syscall6(44, (long)fd, (long)buf, (long)len, 0, 0, 0);
+}
+
+/* TCP read: use standard Linux recvfrom(fd, buf, len, 0, NULL, NULL).
+ * syscall 45 = recvfrom: a1=fd, a2=buf, a3=len, a4=flags, a5=src_addr, a6=addrlen_ptr
+ * With src_addr=NULL and addrlen_ptr=NULL, this reads from a connected TCP socket. */
+long tcp_read(int fd, void *buf, size_t len) {
+    return syscall6(45, (long)fd, (long)buf, (long)len, 0, 0, 0);
+}
+
+/* TCP shutdown: use standard Linux shutdown(fd, how).
+ * syscall 48 = shutdown: a1=fd, a2=how (SHUT_RDWR=2). */
+long tcp_shutdown(int fd) {
+    return syscall2(48, (long)fd, 2);  /* SHUT_RDWR */
+}
+
+/* socket(domain, type, protocol): create a socket file descriptor.
+ * syscall 41 = socket: a1=domain(AF_INET=2), a2=type(SOCK_STREAM=1), a3=protocol(0).
+ * Returns a file descriptor or negative error. */
+long net_socket(int domain, int type, int protocol) {
+    return syscall3(41, (long)domain, (long)type, (long)protocol);
+}
+
+/* DNS gethostbyname: syscall 211(name_addr) -> packed IP */
+long gethostbyname(const char *name) {
+    return syscall1(211, (long)name);
+}
+
+/* ========================================
+ * Threading syscalls (Couche 20)
+ * ======================================== */
+
+/* sys_clone: syscall 56(child_stack)
+ * Creates a new thread sharing the parent address space.
+ * child_stack must have the function pointer at (stack_top - 8). */
+long sys_clone(void *child_stack) {
+    return syscall1(56, (long)child_stack);
+}
+
+/* sys_yield: syscall 24 - voluntarily yield CPU */
+long sys_yield(void) {
+    return syscall1(24, 0);
+}
+
+/* sys_wait: syscall 61(pid) - wait for child to terminate */
+long sys_wait(long pid) {
+    return syscall1(61, pid);
+}
+
+/* thread_create: high-level wrapper
+ * 1. Allocates a 64 KiB stack via mmap
+ * 2. Writes function pointer at (stack_top - 8)
+ * 3. Calls sys_clone with the new stack top
+ * Returns child PID or negative error */
+long thread_create(void (*start_routine)(void)) {
+    /* Allocate 64 KiB for the thread stack */
+    unsigned long stack_size = 65536;
+    void *stack_base = mmap(0, stack_size, 0, 0, 0, 0);
+    if ((long)stack_base < 0) {
+        return -1; /* mmap failed */
+    }
+
+    /* Stack grows downward: top is base + size */
+    unsigned long stack_top = (unsigned long)stack_base + stack_size;
+
+    /* Write function pointer at (stack_top - 8) — the kernel reads this */
+    unsigned long *fn_slot = (unsigned long *)(stack_top - 8);
+    *fn_slot = (unsigned long)start_routine;
+
+    /* Call sys_clone with the stack top */
+    long ret = sys_clone((void *)stack_top);
+    return ret;
+}
+
+/* ========================================
+ * POSIX Fork/Exec syscalls (Jalon 25/26)
+ * ======================================== */
+
+/* fork(): syscall 57 - duplicate the calling process.
+ * Returns: 0 to child, child PID to parent, negative on error. */
+long fork(void) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(57)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+/* execve(path): syscall 59(path_addr) - replace process image.
+ * Does NOT return on success; returns negative on error. */
+long execve(const char *path) {
+    return syscall1(59, (long)path);
+}
+
+/* waitpid(pid): syscall 61(pid) - wait for child to terminate.
+ * Same as sys_wait but named POSIX-style. */
+long waitpid(long pid) {
+    return syscall1(61, pid);
+}
+
+/* open(path, flags): syscall 2(path_addr, flags) - open a file */
+long open(const char *path, int flags) {
+    return syscall2(2, (long)path, (long)flags);
+}
+
+/* close(fd): syscall 3(fd) - close a file descriptor */
+long close(int fd) {
+    return syscall1(3, (long)fd);
+}
+
+/* getdents(fd, buf, bufsize): syscall 78(fd, buf, len) - read directory entries */
+long getdents(int fd, void *buf, size_t bufsize) {
+    return syscall3(78, (long)fd, (long)buf, (long)bufsize);
+}
