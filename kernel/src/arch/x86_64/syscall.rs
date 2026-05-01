@@ -201,6 +201,108 @@ pub fn sysret_trampoline_addr() -> u64 {
     GLOBAL_SYSRET_TRAMPOLINE.load(AtomicOrdering::SeqCst)
 }
 
+// ===== Restore-and-SYSRETQ macro =====
+//
+// Emits the inline asm to restore all user registers from a SyscallContext,
+// set RAX to the given result value, load the user RSP from GS:[8], and
+// jump to the global SYSRETQ trampoline (mov cr3, rdx → swapgs → sysretq).
+//
+// $ctx:    expression of type SyscallContext
+// $pml4:   user PML4 physical address (loaded into rdx for the trampoline)
+// $result: value for RAX (e.g., child PID for wait4, 0 for fork-child)
+
+macro_rules! restore_and_sysret {
+    ($ctx:expr, $pml4:expr, $result:expr) => {{
+        let ctx = $ctx;
+        let pml4_val: u64 = $pml4;
+        let result_val: u64 = $result;
+        unsafe {
+            PER_CPU.user_cr3 = pml4_val;
+            let trampoline = sysret_trampoline_addr();
+            // Jalon 212: Fix register allocation conflict in sysretq restore.
+            //
+            // The old code used `in(reg)` for all ctx fields, letting the compiler
+            // pick ANY register.  If the compiler allocated ctx.rip to R15 (or any
+            // register that we overwrite early), the `mov r15, {v_r15}` instruction
+            // would clobber the value before `mov rcx, {v_rcx}` could read it,
+            // causing the child to jump to the wrong address after sysretq.
+            //
+            // Fix: snapshot ALL context values into local variables FIRST (the
+            // compiler will use its own scratch registers / stack spills for these),
+            // then push them onto the kernel stack in reverse order.  The asm block
+            // pops them into the correct CPU registers in a deterministic order,
+            // eliminating any register reuse hazard.
+            let v_r15  = ctx.r15;
+            let v_r14  = ctx.r14;
+            let v_r13  = ctx.r13;
+            let v_r12  = ctx.r12;
+            let v_rbx  = ctx.rbx;
+            let v_rbp  = ctx.rbp;
+            let v_rsi  = ctx.rsi;
+            let v_rdi  = ctx.rdi;
+            let v_r9   = ctx.r9;
+            let v_r10  = ctx.r10;
+            let v_rfl  = ctx.rflags;  // → R11 for sysretq
+            let v_rip  = ctx.rip;     // → RCX for sysretq
+
+            core::arch::asm!(
+                "cli",
+                // Push values in reverse pop-order onto kernel stack.
+                // This avoids ANY register aliasing: each push reads exactly
+                // one input operand and the stack is the only intermediate store.
+                "push {v_r15}",
+                "push {v_r14}",
+                "push {v_r13}",
+                "push {v_r12}",
+                "push {v_rbx}",
+                "push {v_rbp}",
+                "push {v_rsi}",
+                "push {v_rdi}",
+                "push {v_r9}",
+                "push {v_r10}",
+                "push {v_r11}",  // rflags → R11
+                "push {v_rcx}",  // rip → RCX
+                "push {result}", // → RAX
+
+                // Now pop them into the actual CPU registers (no aliasing possible)
+                "pop rax",
+                "pop rcx",       // user RIP
+                "pop r11",       // user RFLAGS
+                "pop r10",
+                "pop r9",
+                "pop rdi",
+                "pop rsi",
+                "pop rbp",
+                "pop rbx",
+                "pop r12",
+                "pop r13",
+                "pop r14",
+                "pop r15",
+
+                // Load user RSP and jump to the sysretq trampoline
+                "mov rsp, gs:[8]",
+                "jmp r8",
+                in("rdx") pml4_val,
+                in("r8")  trampoline,
+                v_r15  = in(reg) v_r15,
+                v_r14  = in(reg) v_r14,
+                v_r13  = in(reg) v_r13,
+                v_r12  = in(reg) v_r12,
+                v_rbx  = in(reg) v_rbx,
+                v_rbp  = in(reg) v_rbp,
+                v_rsi  = in(reg) v_rsi,
+                v_rdi  = in(reg) v_rdi,
+                v_r9   = in(reg) v_r9,
+                v_r10  = in(reg) v_r10,
+                v_r11  = in(reg) v_rfl,
+                v_rcx  = in(reg) v_rip,
+                result = in(reg) result_val,
+                options(noreturn),
+            );
+        }
+    }};
+}
+
 // ===== MSR helpers =====
 
 #[inline]
@@ -612,12 +714,19 @@ pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
-    // Trace first 60 syscalls of PID 1 for debugging
+    // Trace first syscalls of PID 1 and PID 2 for debugging
     static TRACE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static TRACE_COUNT2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     if current_pid == 1 {
         let c = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if c < 60 {
+        if c < 200 {
             crate::serial_println!("[SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", c, nr, a1, a2, a3);
+        }
+    }
+    if current_pid == 2 {
+        let c = TRACE_COUNT2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if c < 100 {
+            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", c, nr, a1, a2, a3);
         }
     }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
@@ -627,7 +736,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         }).unwrap_or(false);
 
         if is_linux {
-            if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4) {
+            let a6 = saved_user_r9();  // 6th syscall arg (r9), e.g. mmap offset
+            if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4, a5, a6) {
                 return result;
             }
             // Fall through to standard dispatch for non-overridden syscalls
@@ -944,7 +1054,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[206] = Some(sc_zero);          // io_setup
     t[207] = Some(sc_zero);          // io_destroy
     t[213] = Some(sc_epoll_create);   // epoll_create
-    t[217] = Some(sc_zero);          // getdents64 (legacy alias)
+    t[217] = Some(sc_getdents);      // getdents64 — uses same linux_dirent64 format as sc_getdents
     t[218] = Some(sc_set_tid_address);
     t[220] = Some(sc_zero);          // semtimedop
     t[221] = Some(sc_zero);          // fadvise64
@@ -1913,6 +2023,34 @@ fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64)
                         revents |= crate::process::EPOLLOUT;
                     }
                 }
+                Some(crate::process::FdType::PtyMaster) => {
+                    // PTY master: check slave_to_master buffer for read data
+                    let pty_id = crate::process::with_fd_table(pid, |fdt| {
+                        fdt.get(fd as usize).map(|e| e.pty_id)
+                    }).flatten().unwrap_or(0);
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        if crate::drivers::pty::pty_master_readable(pty_id) > 0 {
+                            revents |= crate::process::EPOLLIN;
+                        }
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT; // master write always ready
+                    }
+                }
+                Some(crate::process::FdType::PtySlave) => {
+                    // PTY slave: check master_to_slave buffer for read data
+                    let pty_id = crate::process::with_fd_table(pid, |fdt| {
+                        fdt.get(fd as usize).map(|e| e.pty_id)
+                    }).flatten().unwrap_or(0);
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        if crate::drivers::pty::pty_slave_readable(pty_id) > 0 {
+                            revents |= crate::process::EPOLLIN;
+                        }
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
                 Some(crate::process::FdType::Epoll) => {
                     // Nested epoll: not supported, skip
                 }
@@ -2165,14 +2303,13 @@ fn sys_memfd_create(name_ptr: u64, _flags: u64) -> u64 {
     let pid = crate::scheduler::current_pid();
     if pid == 0 { return ENOSYS; }
 
-    // Read name from userspace into a fixed buffer
+    // Read name from userspace into a fixed buffer (KPTI-safe)
     let mut name_buf = [0u8; 64];
     let mut name_len = 0usize;
     if name_ptr != 0 && validate_user_ptr(name_ptr, 1) {
-        for i in 0..63usize {
-            let b = unsafe { core::ptr::read_volatile((name_ptr + i as u64) as *const u8) };
-            if b == 0 { break; }
-            name_buf[i] = b;
+        let copied = unsafe { copy_from_user(&mut name_buf, name_ptr, 63) };
+        for i in 0..copied {
+            if name_buf[i] == 0 { break; }
             name_len += 1;
         }
     }
@@ -2773,10 +2910,10 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
         }
 
         crate::process::FdType::Socket => {
-            // Jalon 79: Route socket writes directly to TCP send
+            // Session 13: Route socket writes to TCP send via socket module
             if !validate_user_ptr(buf_addr, len) { return EFAULT; }
             crate::serial_println!("[FD-ROUTE] sys_write fd={} -> tcp_send (socket_id={})", fd, socket_id);
-            sys_sendto(fd as u32, buf_addr, len)
+            crate::net::socket::sys_tcp_send(fd as u32, buf_addr, len)
         }
 
         crate::process::FdType::File | crate::process::FdType::Pipe => {
@@ -2840,6 +2977,32 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     Err(_) => EBADF,
                 }
             }
+        }
+
+        crate::process::FdType::PtyMaster => {
+            // Write to PTY master → feeds data to slave's input (line discipline)
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let n = len as usize;
+            let mut kbuf = alloc::vec![0u8; n.min(4096)];
+            let copied = unsafe { copy_from_user(&mut kbuf, buf_addr, n.min(4096)) };
+            let written = crate::drivers::pty::pty_master_write(pty_id, &kbuf[..copied]);
+            written as u64
+        }
+
+        crate::process::FdType::PtySlave => {
+            // Write to PTY slave → output for master to read (stdout of process)
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let n = len as usize;
+            let mut kbuf = alloc::vec![0u8; n.min(4096)];
+            let copied = unsafe { copy_from_user(&mut kbuf, buf_addr, n.min(4096)) };
+            let written = crate::drivers::pty::pty_slave_write(pty_id, &kbuf[..copied]);
+            written as u64
         }
 
         crate::process::FdType::Epoll => {
@@ -2943,6 +3106,28 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                         if lsr2 & 1 == 0 { break; } // no more data
                         let byte: u8;
                         unsafe { core::arch::asm!("in al, dx", out("al") byte, in("dx") 0x3F8u16, options(nomem, nostack)); }
+                        // Ctrl+C (0x03) → deliver SIGINT to foreground process
+                        if byte == 0x03 {
+                            crate::serial_println!("[SIGINT] Ctrl+C from serial -> SIGINT to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 2); // SIGINT = 2
+                            // Echo ^C and return -EINTR
+                            crate::serial_println!("^C");
+                            return (-4i64) as u64; // EINTR
+                        }
+                        // Ctrl+Z (0x1A) → deliver SIGTSTP
+                        if byte == 0x1A {
+                            crate::serial_println!("[SIGTSTP] Ctrl+Z from serial -> SIGTSTP to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 20); // SIGTSTP = 20
+                            crate::serial_println!("^Z");
+                            return (-4i64) as u64; // EINTR
+                        }
+                        // Ctrl+\ (0x1C) → deliver SIGQUIT
+                        if byte == 0x1C {
+                            crate::serial_println!("[SIGQUIT] Ctrl+\\\\ from serial -> SIGQUIT to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 3); // SIGQUIT = 3
+                            crate::serial_println!("^\\\\");
+                            return (-4i64) as u64; // EINTR
+                        }
                         if byte == b'\r' {
                             temp_buf[serial_n] = b'\n'; // Convert CR to LF
                         } else {
@@ -3095,6 +3280,50 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             to_copy as u64
         }
 
+        crate::process::FdType::PtyMaster => {
+            // Read from PTY master → get output from slave (what the process wrote)
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let max_read = core::cmp::min(len as usize, 4096);
+            let mut kbuf = alloc::vec![0u8; max_read];
+            let n = crate::drivers::pty::pty_master_read(pty_id, &mut kbuf);
+            if n > 0 {
+                unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+            }
+            n as u64
+        }
+
+        crate::process::FdType::PtySlave => {
+            // Read from PTY slave → get input from master (user keyboard input)
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let max_read = core::cmp::min(len as usize, 4096);
+            let mut kbuf = alloc::vec![0u8; max_read];
+            let n = crate::drivers::pty::pty_slave_read(pty_id, &mut kbuf);
+            if n > 0 {
+                unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                return n as u64;
+            }
+            // No data — brief spin wait with interrupts enabled
+            let mut attempts: u32 = 0;
+            loop {
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                for _ in 0..20u32 {
+                    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                }
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+                let n = crate::drivers::pty::pty_slave_read(pty_id, &mut kbuf);
+                if n > 0 {
+                    unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                    return n as u64;
+                }
+                attempts += 1;
+                if attempts >= 1_000_000 { return 0; } // timeout → EOF
+            }
+        }
+
         crate::process::FdType::Epoll => {
             // Reads from epoll FDs are not supported
             EBADF
@@ -3117,6 +3346,11 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
     };
 
     let current_pid = crate::scheduler::current_pid();
+
+    // Jalon 212: Log /proc and /dev opens for debugging
+    if path.starts_with("/proc/") || path.starts_with("/dev/") {
+        crate::serial_println!("[SYSCALL] sys_open('{}', flags=0x{:X}) from PID {}", path, flags, current_pid);
+    }
 
     // Reject empty paths (fixes root-directory-as-model-file bug)
     if path.is_empty() {
@@ -3258,7 +3492,13 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                     }
                 }
             } else {
-                return ENOENT;
+                // Jalon 212: Allow opening /proc/* and /dev/* pseudo-filesystem paths.
+                // These are dynamically generated in sys_read, so they don't exist in
+                // the VFS tree, but we still need to allow open() to succeed and return an FD.
+                if !path.starts_with("/proc/") && !path.starts_with("/dev/") && !path.starts_with("/sys/") {
+                    return ENOENT;
+                }
+                // Fall through to FD allocation for pseudo-filesystem paths
             }
         }
     }
@@ -3286,6 +3526,21 @@ fn sys_close(fd: u32) -> u64 {
     }
 
     let current_pid = crate::scheduler::current_pid();
+
+    // Session 13: If this is a socket FD, clean up the socket first
+    let socket_id = crate::process::with_fd_table(current_pid, |fd_table| {
+        if let Some(entry) = fd_table.get(fd as usize) {
+            if entry.fd_type == crate::process::FdType::Socket {
+                return Some(entry.socket_id);
+            }
+        }
+        None
+    }).flatten();
+
+    if let Some(sid) = socket_id {
+        crate::net::socket::sys_socket_close(sid);
+    }
+
     match crate::process::with_fd_table_mut(current_pid, |fd_table| {
         fd_table.close_fd(fd as usize)
     }) {
@@ -3384,8 +3639,11 @@ fn sys_clone(flags: u64, child_stack: u64, _parent_tid: u64, _child_tid: u64, _t
     // Read the function pointer from (child_stack - 8) if using our convention
     // Linux pthread_create puts the start routine differently, but for our
     // no_std binaries, fn_ptr is at stack_top - 8.
+    // KPTI-safe: use copy_from_user to read from user stack
     let fn_ptr = if validate_user_ptr(child_stack.wrapping_sub(8), 8) {
-        unsafe { core::ptr::read_unaligned((child_stack - 8) as *const u64) }
+        let mut fn_buf = [0u8; 8];
+        let copied = unsafe { copy_from_user(&mut fn_buf, child_stack - 8, 8) };
+        if copied == 8 { u64::from_ne_bytes(fn_buf) } else { 0 }
     } else {
         0
     };
@@ -3420,22 +3678,10 @@ static BUS_CON_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Read the 8 callee-saved registers from the kernel syscall stack.
 /// gs:[24] points to the stack frame: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
 /// (pushed by syscall_entry, growing downward)
-fn read_syscall_regs() -> [u64; 8] {
+fn read_syscall_ctx() -> crate::process::SyscallContext {
     let ksp = unsafe { PER_CPU.saved_kernel_rsp };
-    if ksp == 0 { return [0; 8]; }
-    let ptr = ksp as *const u64;
-    unsafe {
-        [
-            core::ptr::read_unaligned(ptr),           // r15
-            core::ptr::read_unaligned(ptr.add(1)),    // r14
-            core::ptr::read_unaligned(ptr.add(2)),    // r13
-            core::ptr::read_unaligned(ptr.add(3)),    // r12
-            core::ptr::read_unaligned(ptr.add(4)),    // rbx
-            core::ptr::read_unaligned(ptr.add(5)),    // rbp
-            core::ptr::read_unaligned(ptr.add(6)),    // r11 (RFLAGS from SYSCALL)
-            core::ptr::read_unaligned(ptr.add(7)),    // rcx (RIP from SYSCALL)
-        ]
-    }
+    if ksp == 0 { return crate::process::SyscallContext::ZERO; }
+    unsafe { crate::process::SyscallContext::from_kernel_stack(ksp) }
 }
 
 /// Voluntarily yield the CPU to another ready process.
@@ -3462,9 +3708,9 @@ fn sys_yield() -> u64 {
     let user_rsp = saved_user_rsp();
     crate::process::save_preempt_state(current, user_rip, user_rsp, 0x202);
 
-    // Jalon 79: Save callee-saved registers from kernel syscall stack
-    let regs = read_syscall_regs();
-    crate::process::save_syscall_regs(current, regs);
+    // Save full register context from kernel syscall stack
+    let ctx = read_syscall_ctx();
+    crate::process::save_syscall_ctx(current, ctx);
 
     // Find next valid userspace process
     let mut next = 0u64;
@@ -3498,12 +3744,12 @@ fn sys_yield() -> u64 {
     }
 
     // Get the next process's saved state
-    let (new_rip, new_rsp, new_rflags, new_pml4, new_regs) =
-        if let Some((rip, rsp, rfl, pml4, regs)) = crate::process::get_preempt_state(next) {
+    let (new_rip, new_rsp, new_rflags, new_pml4, new_ctx) =
+        if let Some((rip, rsp, rfl, pml4, ctx)) = crate::process::get_preempt_state(next) {
             if rip != 0 {
-                (rip, rsp, rfl, pml4, regs)
+                (rip, rsp, rfl, pml4, ctx)
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                (entry, stack, 0x202u64, pml4, [0u64; 8])
+                (entry, stack, 0x202u64, pml4, crate::process::SyscallContext::ZERO)
             } else {
                 return 0;
             }
@@ -3546,14 +3792,12 @@ fn sys_yield() -> u64 {
         crate::serial_write("\n");
     }
 
-    // Jalon 79: Context switch with FULL callee-saved register restoration.
-    // 
+    // Context switch with FULL register restoration via SyscallContext.
+    //
     // Two paths:
-    // 1) First-run process (new_regs all zeroes): Use IRETQ (proven reliable).
-    // 2) Previously-preempted process: Use sysretq with saved registers.
-    
-    let is_first_run = new_regs.iter().all(|&r| r == 0);
-    
+    // 1) First-run process (ctx.rip == 0): Use IRETQ (proven reliable).
+    // 2) Previously-preempted process: Use sysretq via restore_and_sysret! macro.
+
     unsafe {
         // Update PER_CPU with new process's user state
         PER_CPU.user_rsp = new_rsp;
@@ -3561,67 +3805,16 @@ fn sys_yield() -> u64 {
         // KPTI: Store new process's PML4 for syscall_entry's exit CR3 switch
         PER_CPU.user_cr3 = new_pml4;
 
-        if is_first_run {
-            // Jalon 142: First-run process — use the global IRETQ trampoline
-            // via exec_switch_cr3_and_ring3 (which uses the phys_off mini-stack).
+        if !new_ctx.is_valid() {
+            // First-run process — use the global IRETQ trampoline
             crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
             // unreachable
         }
-
-        // Resumed process: restore callee-saved registers and return via sysretq.
-        // Jalon 142: Use the global SYSRETQ trampoline (no per-switch allocation).
-
-        let r15 = new_regs[0];
-        let r14 = new_regs[1];
-        let r13 = new_regs[2];
-        let r12 = new_regs[3];
-        let rbx = new_regs[4];
-        let rbp = new_regs[5];
-        // new_regs[6] = r11 (user RFLAGS) — goes into R11 for sysretq
-        // new_regs[7] = rcx (user RIP)   — goes into RCX for sysretq
-
-        let sysret_trampoline = sysret_trampoline_addr();
-        if sysret_trampoline == 0 {
-            // Fallback: if trampoline isn't initialized, use IRETQ path
-            crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
-        }
-
-        let rip_v: u64 = new_rip;
-        let rfl_v: u64 = new_rflags;
-        let rsp_v: u64 = new_rsp;
-        let cr3_v: u64 = new_pml4;
-        asm!(
-            "cli",
-            // Step 1: Restore callee-saved regs FIRST
-            "mov r15, {r15}",
-            "mov r14, {r14}",
-            "mov r13, {r13}",
-            "mov r12, {r12}",
-            "mov rbx, {rbx}",
-            "mov rbp, {rbp}",
-            // Step 2: Set up for sysretq
-            "mov rcx, rax",           // RCX = user RIP
-            "mov r11, rdi",           // R11 = user RFLAGS
-            "mov rsp, rsi",           // RSP = user stack
-            // Step 3: Jump to global trampoline that does: mov cr3 → swapgs → sysretq
-            // r8 holds the trampoline address, rdx holds the CR3 value
-            "jmp r8",
-            // Explicit register bindings
-            in("rax") rip_v,
-            in("rdi") rfl_v,
-            in("rsi") rsp_v,
-            in("rdx") cr3_v,
-            in("r8") sysret_trampoline,
-            // Generic register bindings for callee-saved values
-            r15 = in(reg) r15,
-            r14 = in(reg) r14,
-            r13 = in(reg) r13,
-            r12 = in(reg) r12,
-            rbx = in(reg) rbx,
-            rbp = in(reg) rbp,
-            options(noreturn),
-        );
     }
+
+    // Resumed process: restore ALL registers and sysretq.
+    // RAX = 0 for the yield return value (sched_yield returns 0).
+    restore_and_sysret!(new_ctx, new_pml4, 0u64);
 }
 
 /// Fork the current process (Jalon 25a - REAL UNIX FORK).
@@ -3654,27 +3847,13 @@ fn sys_fork() -> u64 {
     };
 
     // Capture parent's current user-mode return state from this syscall.
-    // syscall_entry saved: user RIP in RCX -> gs:[16], user RSP -> gs:[8].
-    // The kernel stack has: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
     let parent_rip = saved_user_rip();
     let parent_rsp = saved_user_rsp();
     let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
-    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
-        let ptr = parent_kernel_rsp as *const u64;
-        unsafe {
-            [
-                core::ptr::read_unaligned(ptr),          // r15
-                core::ptr::read_unaligned(ptr.add(1)),   // r14
-                core::ptr::read_unaligned(ptr.add(2)),   // r13
-                core::ptr::read_unaligned(ptr.add(3)),   // r12
-                core::ptr::read_unaligned(ptr.add(4)),   // rbx
-                core::ptr::read_unaligned(ptr.add(5)),   // rbp
-                core::ptr::read_unaligned(ptr.add(6)),   // r11 (RFLAGS)
-                core::ptr::read_unaligned(ptr.add(7)),   // rcx (RIP)
-            ]
-        }
+    let saved_ctx = if parent_kernel_rsp != 0 {
+        unsafe { crate::process::SyscallContext::from_kernel_stack(parent_kernel_rsp) }
     } else {
-        [0; 8]
+        crate::process::SyscallContext::ZERO
     };
 
     // Create the child process with deep-copied PML4
@@ -3691,7 +3870,7 @@ fn sys_fork() -> u64 {
             crate::process::with_process_mut(child_pid, |child| {
                 child.saved_user_rip = parent_rip;
                 child.saved_user_rsp = parent_rsp;
-                child.saved_syscall_regs = saved_regs;
+                child.saved_ctx = saved_ctx;
                 child.is_forked = true;  // Flag: resume via sysretq with RAX=0
             });
 
@@ -3730,10 +3909,12 @@ unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
         let pml4_entry = core::ptr::read_unaligned(src_pml4.add(pml4_i));
         if pml4_entry & 0x01 == 0 { continue; } // not present
 
-        // Kernel entries: PML4[0], PML4[256..511], or any entry WITHOUT USER_ACCESSIBLE — share verbatim
+        // Kernel entries: PML4[256..511], or any entry WITHOUT USER_ACCESSIBLE — share verbatim
         // CRITICAL: The kernel heap at 0x4444_4444_0000 maps to PML4[136] which must be shared,
         // not deep-copied, so child processes see the same kernel data structures (PROCESS_TABLE etc.)
-        if pml4_i == 0 || pml4_i >= 256 || (pml4_entry & 0x04) == 0 {
+        // NOTE: PML4[0] is NOT special-cased anymore. Linux/musl binaries (BusyBox) load at
+        // 0x400000 which is in PML4[0], so if it has USER_ACCESSIBLE pages they must be deep-copied.
+        if pml4_i >= 256 || (pml4_entry & 0x04) == 0 {
             core::ptr::write_unaligned(new_pml4.add(pml4_i), pml4_entry);
             continue;
         }
@@ -3836,7 +4017,11 @@ fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc:
     for i in 0..max {
         let ptr_addr = array_addr + (i as u64) * 8;
         if !validate_user_ptr(ptr_addr, 8) { break; }
-        let str_ptr = unsafe { core::ptr::read_unaligned(ptr_addr as *const u64) };
+        // KPTI-safe: copy the string pointer from user space
+        let mut ptr_buf = [0u8; 8];
+        let copied = unsafe { copy_from_user(&mut ptr_buf, ptr_addr, 8) };
+        if copied < 8 { break; }
+        let str_ptr = u64::from_ne_bytes(ptr_buf);
         if str_ptr == 0 { break; } // NULL terminator
         if !validate_user_ptr(str_ptr, 1) { break; }
         match unsafe { read_user_string(str_ptr) } {
@@ -4096,9 +4281,10 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
             );
 
 
-            // Replace the current process's address space and state
-            // Jalon 94: Free the OLD page table before replacing
-            let _old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
+            // Replace the current process's address space and state.
+            // Save old PML4 so we can free it after updating the process struct.
+            // This prevents a PML4 leak on every execve.
+            let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = launch_entry;  // Use interpreter entry for dynamic binaries
@@ -4109,7 +4295,7 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                 // Clear saved state
                 p.saved_user_rip = 0;
                 p.saved_user_rsp = 0;
-                p.saved_syscall_regs = [0; 8];
+                p.saved_ctx = crate::process::SyscallContext::ZERO;
                 p.is_forked = false;
                 // Jalon 127: Store argv for /proc/self/cmdline
                 p.argv = argv.clone();
@@ -4119,8 +4305,17 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                 p.signal_mask = 0;
             });
 
-            // Jalon 94: Free old page table AFTER CR3 has been changed
-            // We'll free it right after switching to the new PML4
+            // Jalon 94: Free old page table NOW (before switching CR3).
+            // We're still on the kernel PML4 (which shares kernel entries),
+            // so the old user PML4 can be freed safely.
+            // Skip if old_pml4 == 0 (first exec) or same as new (shouldn't happen).
+            if old_pml4 != 0 && old_pml4 != result.pml4_phys {
+                crate::serial_println!(
+                    "[EXEC-GC] Freeing old PML4=0x{:X} (replaced by 0x{:X})",
+                    old_pml4, result.pml4_phys
+                );
+                unsafe { crate::elf::free_user_page_table(old_pml4); }
+            }
             crate::serial_println!(
                 "[EXEC] Switching to Ring 3: {} entry=0x{:X} (launch=0x{:X}) rsp=0x{:X} pml4=0x{:X}",
                 resolved, result.entry_point, launch_entry, final_rsp, result.pml4_phys
@@ -4349,10 +4544,10 @@ fn sys_exit(code: u64) -> u64 {
             // by syscall_entry. We restore the kernel RSP to that point and let the
             // normal pop + sysretq path run, which correctly restores all user registers.
             let parent_info = crate::process::with_process(parent_pid, |p| {
-                (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_syscall_regs)
+                (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_ctx)
             });
 
-            if let Some((saved_rip, saved_rsp, pml4, _saved_kernel_rsp, saved_regs)) = parent_info {
+            if let Some((saved_rip, saved_rsp, pml4, _saved_kernel_rsp, saved_ctx)) = parent_info {
                 crate::serial_println!(
                     "[SYSCALL] All threads done, resuming parent PID {} at RIP=0x{:X} RSP=0x{:X}",
                     parent_pid, saved_rip, saved_rsp
@@ -4362,65 +4557,15 @@ fn sys_exit(code: u64) -> u64 {
                 crate::scheduler::set_current_pid(parent_pid);
                 let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Running);
 
-                // KPTI: Set user_cr3 for parent and switch via trampoline
-                unsafe {
-                    PER_CPU.user_cr3 = pml4;
-                }
-
-                let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                let wait_result = current; // child PID (Linux wait4 convention)
                 crate::serial_println!(
-                    "[SYSCALL] sysretq to parent: RAX=0x{:X}, regs saved={}",
-                    wait_result, saved_regs[7] != 0
+                    "[SYSCALL] sysretq to parent: RAX=0x{:X} (child PID), regs saved={}",
+                    wait_result, saved_ctx.is_valid()
                 );
 
-                if saved_regs[7] != 0 {
-                    let r15 = saved_regs[0];
-                    let r14 = saved_regs[1];
-                    let r13 = saved_regs[2];
-                    let r12 = saved_regs[3];
-                    let rbx = saved_regs[4];
-                    let rbp = saved_regs[5];
-                    let r11 = saved_regs[6];
-                    let rcx = saved_regs[7];
-
-                    unsafe {
-                        PER_CPU.user_rsp = saved_rsp;
-
-                        // KPTI: sysretq trampoline
-                        let tb = alloc::vec![0u8; 64];
-                        let tp = tb.as_ptr() as *mut u8;
-                        let ta = tp as u64;
-                        *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA; // mov cr3,rdx
-                        *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8; // swapgs
-                        *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07; // sysretq
-
-                        core::arch::asm!(
-                            "cli",
-                            "mov r15, {v_r15}",
-                            "mov r14, {v_r14}",
-                            "mov r13, {v_r13}",
-                            "mov r12, {v_r12}",
-                            "mov rbx, {v_rbx}",
-                            "mov rbp, {v_rbp}",
-                            "mov r11, {v_r11}",
-                            "mov rcx, {v_rcx}",
-                            "mov rax, {result}",
-                            "mov rsp, gs:[8]",
-                            "jmp r8",
-                            in("rdx") pml4,
-                            in("r8") ta,
-                            v_r15 = in(reg) r15,
-                            v_r14 = in(reg) r14,
-                            v_r13 = in(reg) r13,
-                            v_r12 = in(reg) r12,
-                            v_rbx = in(reg) rbx,
-                            v_rbp = in(reg) rbp,
-                            v_r11 = in(reg) r11,
-                            v_rcx = in(reg) rcx,
-                            result = in(reg) wait_result,
-                            options(noreturn),
-                        );
-                    }
+                if saved_ctx.is_valid() {
+                    unsafe { PER_CPU.user_rsp = saved_rsp; }
+                    restore_and_sysret!(saved_ctx, pml4, wait_result);
                 } else if saved_rip != 0 && saved_rsp != 0 {
                     // Fallback IRETQ trampoline
                     crate::serial_println!(
@@ -4510,11 +4655,11 @@ fn sys_exit(code: u64) -> u64 {
 
                 let parent_ctx = crate::process::with_process(parent_pid, |p| {
                     (p.saved_user_rip, p.saved_user_rsp, p.saved_kernel_rsp,
-                     p.saved_syscall_regs, p.pml4_phys)
+                     p.saved_ctx, p.pml4_phys)
                 });
 
-                if let Some((saved_rip, saved_rsp, _parent_kernel_rsp, saved_regs, pml4)) = parent_ctx {
-                    if saved_regs[7] != 0 {
+                if let Some((saved_rip, saved_rsp, _parent_kernel_rsp, saved_ctx, pml4)) = parent_ctx {
+                    if saved_ctx.is_valid() {
                         // Set parent back to Running
                         let _ = crate::process::set_state(
                             parent_pid,
@@ -4522,61 +4667,27 @@ fn sys_exit(code: u64) -> u64 {
                         );
                         crate::scheduler::set_current_pid(parent_pid);
 
-                        // Build wait result: (child_pid << 16) | exit_code
-                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
-
-                        let r15 = saved_regs[0];
-                        let r14 = saved_regs[1];
-                        let r13 = saved_regs[2];
-                        let r12 = saved_regs[3];
-                        let rbx = saved_regs[4];
-                        let rbp = saved_regs[5];
-                        let r11 = saved_regs[6]; // RFLAGS
-                        let rcx = saved_regs[7]; // RIP
+                        // Jalon 155: Return just the child PID (Linux wait4 convention).
+                        let wait_result = current; // child PID
 
                         unsafe { PER_CPU.user_rsp = saved_rsp; }
 
                         crate::serial_println!(
                             "[SYSCALL] Resuming parent PID {} via sysretq: RAX=0x{:X} RIP=0x{:X} RSP=0x{:X}",
-                            parent_pid, wait_result, rcx, saved_rsp
+                            parent_pid, wait_result, saved_ctx.rip, saved_rsp
+                        );
+                        crate::serial_println!(
+                            "[RESUME-REGS] r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} rflags=0x{:X} rip=0x{:X}",
+                            saved_ctx.r15, saved_ctx.r14, saved_ctx.r13, saved_ctx.r12,
+                            saved_ctx.rbx, saved_ctx.rbp, saved_ctx.rflags, saved_ctx.rip
+                        );
+                        crate::serial_println!(
+                            "[RESUME-REGS] r9=0x{:X} r10=0x{:X} r8=0x{:X} rdx=0x{:X} rsi=0x{:X} rdi=0x{:X}",
+                            saved_ctx.r9, saved_ctx.r10, saved_ctx.r8, saved_ctx.rdx,
+                            saved_ctx.rsi, saved_ctx.rdi
                         );
 
-                        unsafe {
-                            PER_CPU.user_cr3 = pml4;
-                            // KPTI: sysretq trampoline
-                            let tb = alloc::vec![0u8; 64];
-                            let tp = tb.as_ptr() as *mut u8;
-                            let ta = tp as u64;
-                            *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
-                            *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
-                            *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
-                            core::arch::asm!(
-                                "cli",
-                                "mov r15, {v_r15}",
-                                "mov r14, {v_r14}",
-                                "mov r13, {v_r13}",
-                                "mov r12, {v_r12}",
-                                "mov rbx, {v_rbx}",
-                                "mov rbp, {v_rbp}",
-                                "mov r11, {v_r11}",
-                                "mov rcx, {v_rcx}",
-                                "mov rax, {result}",
-                                "mov rsp, gs:[8]",
-                                "jmp r8",
-                                in("rdx") pml4,
-                                in("r8") ta,
-                                v_r15 = in(reg) r15,
-                                v_r14 = in(reg) r14,
-                                v_r13 = in(reg) r13,
-                                v_r12 = in(reg) r12,
-                                v_rbx = in(reg) rbx,
-                                v_rbp = in(reg) rbp,
-                                v_r11 = in(reg) r11,
-                                v_rcx = in(reg) rcx,
-                                result = in(reg) wait_result,
-                                options(noreturn),
-                            );
-                        }
+                        restore_and_sysret!(saved_ctx, pml4, wait_result);
                     } else if saved_rip != 0 && saved_rsp != 0 {
                         // Fallback: IRETQ if no kernel registers saved
                         let _ = crate::process::set_state(
@@ -4585,7 +4696,7 @@ fn sys_exit(code: u64) -> u64 {
                         );
                         crate::scheduler::set_current_pid(parent_pid);
 
-                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                        let wait_result = current; // child PID (Linux convention)
                         crate::serial_println!(
                             "[SYSCALL] Fallback IRETQ to parent PID {}: RIP=0x{:X}",
                             parent_pid, saved_rip
@@ -4676,11 +4787,11 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
     if let Some((next_pid, entry, stack, pml4, name)) = next_ready {
         // Check if this is a forked child that should resume at parent's saved RIP
         let fork_info = crate::process::with_process(next_pid, |p| {
-            (p.is_forked, p.saved_user_rip, p.saved_user_rsp, p.saved_syscall_regs)
+            (p.is_forked, p.saved_user_rip, p.saved_user_rsp, p.saved_ctx)
         });
 
-        if let Some((true, saved_rip, saved_rsp, saved_regs)) = fork_info {
-            if saved_regs[7] != 0 {
+        if let Some((true, saved_rip, saved_rsp, saved_ctx)) = fork_info {
+            if saved_ctx.is_valid() {
                 // Forked child: resume at parent's exact RIP with RAX=0
                 crate::serial_println!(
                     "[SYSCALL] Launching FORKED child PID {} ({}) via sysretq with RAX=0, RIP=0x{:X}",
@@ -4692,61 +4803,13 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                 // Clear the forked flag so it won't re-trigger
                 crate::process::with_process_mut(next_pid, |p| { p.is_forked = false; });
 
-                let r15 = saved_regs[0];
-                let r14 = saved_regs[1];
-                let r13 = saved_regs[2];
-                let r12 = saved_regs[3];
-                let rbx = saved_regs[4];
-                let rbp = saved_regs[5];
-                let r11 = saved_regs[6]; // RFLAGS
-                let rcx = saved_regs[7]; // RIP
-
                 // Write child's user RSP into PER_CPU + KPTI user_cr3
                 unsafe {
                     PER_CPU.user_rsp = saved_rsp;
-                    PER_CPU.user_cr3 = pml4;
                 }
 
-                unsafe {
-                    // KPTI: Allocate sysretq trampoline on kernel heap
-                    let tb = alloc::vec![0u8; 64];
-                    let tp = tb.as_ptr() as *mut u8;
-                    let ta = tp as u64;
-                    // mov cr3, rdx   (0F 22 DA)
-                    *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
-                    // swapgs           (0F 01 F8)
-                    *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
-                    // sysretq           (48 0F 07)
-                    *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
-
-                    core::arch::asm!(
-                        "cli",
-                        "mov r15, {v_r15}",
-                        "mov r14, {v_r14}",
-                        "mov r13, {v_r13}",
-                        "mov r12, {v_r12}",
-                        "mov rbx, {v_rbx}",
-                        "mov rbp, {v_rbp}",
-                        "mov r11, {v_r11}",
-                        "mov rcx, {v_rcx}",
-                        "xor eax, eax",         // RAX = 0 (fork return for child!)
-                        "mov rsp, gs:[8]",      // Restore user RSP
-                        // Jump to heap trampoline: mov cr3 → swapgs → sysretq
-                        "jmp r8",
-                        in("rdx") pml4,
-                        in("r8") ta,
-                        v_r15 = in(reg) r15,
-                        v_r14 = in(reg) r14,
-                        v_r13 = in(reg) r13,
-                        v_r12 = in(reg) r12,
-                        v_rbx = in(reg) rbx,
-                        v_rbp = in(reg) rbp,
-                        v_r11 = in(reg) r11,
-                        v_rcx = in(reg) rcx,
-                        options(noreturn),
-                    );
-                    // tb leaked intentionally
-                }
+                // Fork child returns 0
+                restore_and_sysret!(saved_ctx, pml4, 0u64);
             }
         }
 
@@ -4816,7 +4879,10 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
 /// saves the parent's user context so it can be resumed when all children are done.
 fn sys_wait(pid: u64) -> u64 {
     let current = crate::scheduler::current_pid();
-    crate::serial_println!("[SYSCALL] sys_wait({}) from PID {}", pid, current);
+    let is_linux = crate::process::with_process(current, |p| {
+        p.abi == crate::compat::linux_abi::Abi::Linux
+    }).unwrap_or(false);
+    crate::serial_println!("[SYSCALL] sys_wait({}) from PID {} (linux_abi={}, SHOULD NOT be called for Linux processes!)", pid, current, is_linux);
 
     // Save the parent's user-mode return address so we can resume after threads
     let parent_rip = saved_user_rip();
@@ -4824,35 +4890,30 @@ fn sys_wait(pid: u64) -> u64 {
     // PER_CPU.saved_kernel_rsp was set by syscall_entry for THIS syscall (parent's).
     // Save it now before any child syscalls overwrite it.
     let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
-    // Copy the 8 saved registers from the kernel stack into the process struct.
+    // Capture ALL registers from the kernel stack into a typed SyscallContext.
     // The shared kernel syscall stack will be overwritten by child thread syscalls.
-    // Stack layout (from RSP upward): r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)
-    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
-        let ptr = parent_kernel_rsp as *const u64;
-        unsafe {
-            [
-                core::ptr::read_unaligned(ptr),          // r15
-                core::ptr::read_unaligned(ptr.add(1)),   // r14
-                core::ptr::read_unaligned(ptr.add(2)),   // r13
-                core::ptr::read_unaligned(ptr.add(3)),   // r12
-                core::ptr::read_unaligned(ptr.add(4)),   // rbx
-                core::ptr::read_unaligned(ptr.add(5)),   // rbp
-                core::ptr::read_unaligned(ptr.add(6)),   // r11 (RFLAGS)
-                core::ptr::read_unaligned(ptr.add(7)),   // rcx (RIP)
-            ]
-        }
+    let saved_ctx = if parent_kernel_rsp != 0 {
+        unsafe { crate::process::SyscallContext::from_kernel_stack(parent_kernel_rsp) }
     } else {
-        [0; 8]
+        crate::process::SyscallContext::ZERO
     };
     crate::process::with_process_mut(current, |p| {
         p.saved_user_rip = parent_rip;
         p.saved_user_rsp = parent_rsp;
         p.saved_kernel_rsp = parent_kernel_rsp;
-        p.saved_syscall_regs = saved_regs;
+        p.saved_ctx = saved_ctx;
     });
     crate::serial_println!(
-        "[SYSCALL] wait: saved parent ctx RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X} rcx(RIP)=0x{:X} r11(FL)=0x{:X}",
-        parent_rip, parent_rsp, parent_kernel_rsp, saved_regs[7], saved_regs[6]
+        "[SYSCALL] wait: saved parent ctx RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X} ctx.rip=0x{:X} ctx.rflags=0x{:X}",
+        parent_rip, parent_rsp, parent_kernel_rsp, saved_ctx.rip, saved_ctx.rflags
+    );
+    crate::serial_println!(
+        "[WAIT-SAVE] caller: r9=0x{:X} r10=0x{:X} r8=0x{:X} rdx=0x{:X} rsi=0x{:X} rdi=0x{:X}",
+        saved_ctx.r9, saved_ctx.r10, saved_ctx.r8, saved_ctx.rdx, saved_ctx.rsi, saved_ctx.rdi
+    );
+    crate::serial_println!(
+        "[WAIT-SAVE] callee: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X}",
+        saved_ctx.r15, saved_ctx.r14, saved_ctx.r13, saved_ctx.r12, saved_ctx.rbx, saved_ctx.rbp
     );
 
     // Check for ready child threads to run
@@ -4896,15 +4957,15 @@ fn sys_wait(pid: u64) -> u64 {
     // No child threads to launch — check for forked children to launch
     // A forked child has is_forked=true and should be launched with sysretq(RAX=0).
     let forked_child = crate::process::find_ready_forked_child(current, pid);
-    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_regs)) = forked_child {
+    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_ctx)) = forked_child {
         crate::serial_println!(
             "[SYSCALL] wait: launching FORKED child PID {} (RIP=0x{:X}, RSP=0x{:X})",
             child_pid, child_rip, child_rsp
         );
         crate::serial_println!(
-            "[FORK-LAUNCH] regs: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} r11=0x{:X} rcx=0x{:X}",
-            child_regs[0], child_regs[1], child_regs[2], child_regs[3],
-            child_regs[4], child_regs[5], child_regs[6], child_regs[7]
+            "[FORK-LAUNCH] ctx: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} rflags=0x{:X} rip=0x{:X}",
+            child_ctx.r15, child_ctx.r14, child_ctx.r13, child_ctx.r12,
+            child_ctx.rbx, child_ctx.rbp, child_ctx.rflags, child_ctx.rip
         );
 
         // Mark child as Running, parent as Blocked
@@ -4916,63 +4977,73 @@ fn sys_wait(pid: u64) -> u64 {
         // Clear forked flag
         crate::process::with_process_mut(child_pid, |p| { p.is_forked = false; });
 
-        let r15 = child_regs[0];
-        let r14 = child_regs[1];
-        let r13 = child_regs[2];
-        let r12 = child_regs[3];
-        let rbx = child_regs[4];
-        let rbp = child_regs[5];
-        let r11 = child_regs[6];
-        let rcx = child_regs[7];
-
-        unsafe { PER_CPU.user_rsp = child_rsp; }
-
+        // DIAGNOSTIC: Verify child PML4 can resolve the target RIP
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
-            core::arch::asm!(
-                "mov r15, {v_r15}",
-                "mov r14, {v_r14}",
-                "mov r13, {v_r13}",
-                "mov r12, {v_r12}",
-                "mov rbx, {v_rbx}",
-                "mov rbp, {v_rbp}",
-                "mov r11, {v_r11}",
-                "mov rcx, {v_rcx}",
-                "xor eax, eax",         // RAX = 0 (fork return for child!)
-                "mov rsp, gs:[8]",
-                "swapgs",
-                "sysretq",
-                v_r15 = in(reg) r15,
-                v_r14 = in(reg) r14,
-                v_r13 = in(reg) r13,
-                v_r12 = in(reg) r12,
-                v_rbx = in(reg) rbx,
-                v_rbp = in(reg) rbp,
-                v_r11 = in(reg) r11,
-                v_rcx = in(reg) rcx,
-                options(noreturn),
+            let frame = crate::elf::lookup_page_frame_pub(child_pml4, child_ctx.rip);
+            crate::serial_println!(
+                "[FORK-DIAG] child PML4=0x{:X} RIP=0x{:X} -> frame={:?}",
+                child_pml4, child_ctx.rip, frame
+            );
+            let stack_frame = crate::elf::lookup_page_frame_pub(child_pml4, child_rsp & !0xFFF);
+            crate::serial_println!(
+                "[FORK-DIAG] child RSP page=0x{:X} -> frame={:?}",
+                child_rsp & !0xFFF, stack_frame
+            );
+            let lstar = rdmsr(IA32_LSTAR);
+            let lstar_pml4_idx = (lstar >> 39) & 0x1FF;
+            let po = crate::elf::phys_offset();
+            let pml4_virt = (child_pml4 + po) as *const u64;
+            let lstar_entry = core::ptr::read_volatile(pml4_virt.add(lstar_pml4_idx as usize));
+            crate::serial_println!(
+                "[FORK-DIAG] LSTAR=0x{:X} PML4[{}]=0x{:X} (P={})",
+                lstar, lstar_pml4_idx, lstar_entry, lstar_entry & 1
             );
         }
+
+        unsafe {
+            PER_CPU.user_rsp = child_rsp;
+        }
+
+        crate::serial_println!(
+            "[FORK-LAUNCH] sysretq trampoline=0x{:X}, target RIP=0x{:X} RFLAGS=0x{:X} RSP=0x{:X}",
+            sysret_trampoline_addr(), child_ctx.rip, child_ctx.rflags, child_rsp
+        );
+
+        // Fork child returns 0
+        restore_and_sysret!(child_ctx, child_pml4, 0u64);
     }
 
-    // No child threads to launch — poll for already-terminated children
-    let max_iters = 50_000_000u64;
-    for _ in 0..max_iters {
+    // No child threads or forked children to launch directly.
+    // Enable interrupts so the timer ISR can preemptively schedule the child,
+    // then poll for terminated children.
+    let max_iters = 5_000_000u64;
+    for i in 0..max_iters {
         match crate::process::wait_for_child(current) {
             Ok((child_pid, exit_code)) => {
-                crate::serial_println!("[SYSCALL] wait: child PID {} exited with {}", child_pid, exit_code);
-                // Return child PID in upper 16 bits, exit code in lower 16
-                return ((child_pid & 0xFFFF) << 16) | (exit_code as u64 & 0xFFFF);
+                crate::serial_println!("[SYSCALL] wait: child PID {} exited with code {}", child_pid, exit_code);
+                // Return child PID (Linux wait4 convention)
+                return child_pid;
             }
             Err(crate::process::ProcessError::WaitingForChild) => {
-                // No child terminated yet, yield
-                unsafe { asm!("pause", options(nomem, nostack)); }
+                // Enable interrupts so the timer ISR fires and can schedule the child
+                unsafe {
+                    asm!("sti", options(nomem, nostack));
+                    for _ in 0..100u32 {
+                        asm!("pause", options(nomem, nostack));
+                    }
+                    asm!("cli", options(nomem, nostack));
+                }
+                // Periodically yield to give the child a chance to run
+                if i % 1000 == 0 {
+                    crate::scheduler::yield_to_next(current);
+                }
             }
             Err(_) => return ECHILD,
         }
     }
 
     // Timeout
+    crate::serial_println!("[SYSCALL] wait: timeout after {} iters, returning ECHILD", max_iters);
     ECHILD
 }
 
@@ -6414,11 +6485,11 @@ fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
         };
 
         if is_tcp {
-            // TCP send: read length prefix from buf, then send data
-            let len = unsafe {
-                let ptr = buf_addr as *const u64;
-                core::ptr::read_unaligned(ptr)
-            };
+            // TCP send: read length prefix from buf (KPTI-safe), then send data
+            let mut len_buf = [0u8; 8];
+            let copied = unsafe { copy_from_user(&mut len_buf, buf_addr, 8) };
+            if copied < 8 { return EFAULT; }
+            let len = u64::from_ne_bytes(len_buf);
             crate::serial_println!("[SYSCALL] sys_sendto/TCP(fd={}, len={})", fd, len);
             return crate::net::socket::sys_tcp_send(fd, buf_addr + 8, len);
         }
@@ -6434,11 +6505,11 @@ fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
         (ip_u32 & 0xFF) as u8,
     ]);
 
-    // Read length from user (first 8 bytes of buf contain length)
-    let len = unsafe {
-        let ptr = buf_addr as *const u64;
-        core::ptr::read_unaligned(ptr)
-    };
+    // Read length from user (first 8 bytes of buf contain length, KPTI-safe)
+    let mut len_buf2 = [0u8; 8];
+    let copied2 = unsafe { copy_from_user(&mut len_buf2, buf_addr, 8) };
+    if copied2 < 8 { return EFAULT; }
+    let len = u64::from_ne_bytes(len_buf2);
 
     crate::serial_println!("[SYSCALL] sys_sendto(fd={}, buf=0x{:X}, len={}, dst={}:{})",
         fd, buf_addr + 8, len, ip, port);
@@ -6499,21 +6570,29 @@ fn sys_net_ping(ip_packed: u64, sequence: u16) -> u64 {
 /// Also supports legacy AetherionOS encoding: encoded_ip = a<<24|b<<16|c<<8|d, port in a3
 fn sys_tcp_connect(fd: u32, addr_or_ip: u64, len_or_port: u64) -> u64 {
     // Detect Linux ABI vs legacy encoding:
-    // Linux sockaddr_in is at least 16 bytes, and addr_or_ip would be a valid user pointer
-    // Legacy: addr_or_ip is a packed IP (< 0x100000000), len_or_port is a port number (< 65536)
-    if addr_or_ip >= 0x1000 && len_or_port >= 8 && validate_user_ptr(addr_or_ip, 8) {
-        // Linux ABI: parse struct sockaddr_in from user memory
-        let family = unsafe { core::ptr::read_unaligned(addr_or_ip as *const u16) };
+    // Linux ABI: addr_or_ip is a user pointer to sockaddr_in, len_or_port is addrlen (16 for AF_INET)
+    // Legacy AetherionOS: addr_or_ip is a packed IP (a<<24|b<<16|c<<8|d), len_or_port is a port (<= 65535)
+    //
+    // Heuristic: Linux sockaddr_in has addrlen=16. User pointers are typically > 0x400000.
+    // Packed IPs fit in u32 (<= 0xFFFFFFFF). We distinguish by requiring len_or_port to be
+    // exactly 16 (sizeof sockaddr_in) for Linux ABI mode.
+    if len_or_port == 16 && addr_or_ip >= 0x10000 && validate_user_ptr(addr_or_ip, 16) {
+        // KPTI-safe: copy sockaddr_in from user space (need at least 8 bytes: family+port+ip)
+        let mut sa_buf = [0u8; 16];
+        let copied = unsafe { copy_from_user(&mut sa_buf, addr_or_ip, 16) };
+        if copied < 8 {
+            crate::serial_println!("[SYSCALL] sys_connect: copy_from_user failed (copied={}/16)", copied);
+            return EFAULT;
+        }
+        let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
         if family == 2 {
-            // AF_INET — parse Big Endian port and IP
-            let port_be = unsafe { core::ptr::read_unaligned((addr_or_ip + 2) as *const u16) };
+            // AF_INET — parse Big Endian port and IP from copied buffer
+            let port_be = u16::from_ne_bytes([sa_buf[2], sa_buf[3]]);
             let port = u16::from_be(port_be);
-            let ip_be = unsafe { core::ptr::read_unaligned((addr_or_ip + 4) as *const u32) };
-            let ip_bytes = ip_be.to_be_bytes(); // Network byte order → [a, b, c, d]
-            let ip_a = ip_bytes[0];
-            let ip_b = ip_bytes[1];
-            let ip_c = ip_bytes[2];
-            let ip_d = ip_bytes[3];
+            let ip_a = sa_buf[4];
+            let ip_b = sa_buf[5];
+            let ip_c = sa_buf[6];
+            let ip_d = sa_buf[7];
             crate::serial_println!("[SYSCALL] sys_connect/LinuxABI(fd={}, {}.{}.{}.{}:{}, family=AF_INET)",
                 fd, ip_a, ip_b, ip_c, ip_d, port);
             return crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, port);
@@ -6549,7 +6628,9 @@ fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
     if !validate_user_ptr(buf_addr, len) {
         return EFAULT;
     }
-    crate::net::socket::sys_tcp_recv(fd, buf_addr, len)
+    // Use blocking recv so that read() on a socket waits for data
+    // (BusyBox wget / musl libc expect read() to block until data arrives)
+    crate::net::socket::sys_tcp_recv_blocking(fd, buf_addr, len)
 }
 
 /// sys_tcp_recv_blocking(fd, buf_addr, len) -> bytes read (polls network with timeout)
@@ -7246,7 +7327,7 @@ fn sys_getprocs(buf_addr: u64, buf_size: u64) -> u64 {
     let bytes = output.as_bytes();
     let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
     if to_copy > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+        unsafe { copy_to_user(buf_addr, &bytes[..to_copy]); }
     }
     to_copy as u64
 }
@@ -7337,7 +7418,7 @@ fn sys_sysinfo(buf_addr: u64) -> u64 {
     let bytes = out.as_bytes();
     let to_copy = core::cmp::min(bytes.len(), SYSINFO_MAX as usize);
     if to_copy > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+        unsafe { copy_to_user(buf_addr, &bytes[..to_copy]); }
     }
     to_copy as u64
 }
@@ -7972,6 +8053,12 @@ pub fn sys_fork_pub() -> u64 {
     sys_fork()
 }
 
+/// Public wrapper for sys_wait, used by compat::linux_abi (linux_wait4)
+/// This performs the actual context switch to the forked child.
+pub fn sys_wait_pub(pid: u64) -> u64 {
+    sys_wait(pid)
+}
+
 /// Public wrapper for saved_user_rip, used by compat::linux_abi (clone thread)
 pub fn saved_user_rip_pub() -> u64 {
     saved_user_rip()
@@ -8000,4 +8087,9 @@ pub fn epoll_wait_real_pub(epfd: u64, events_ptr: u64, maxevents: u64, timeout: 
 /// Public wrapper for sys_epoll_create1, used by compat::linux_abi
 pub fn sys_epoll_create1_pub(flags: u64) -> u64 {
     sys_epoll_create1(flags)
+}
+
+/// Public wrapper for sys_exit (used by linux_exit_group)
+pub fn sys_exit_pub(code: u64) -> u64 {
+    sys_exit(code)
 }
