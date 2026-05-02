@@ -1,25 +1,13 @@
-// Aetherion OS - Device Drivers
-// Phase 3+: Hardware abstraction with advanced features
+// kernel/src/drivers/mod.rs - Device Drivers (Couche 19+)
+//
+// VirtIO-Block driver for persistent storage
+// PS/2 Mouse driver for HID input (Jalon 37)
+// PS/2 Controller (8042) initialization
+// USB 3.0 xHCI controller (Jalon 77)
 
-// Basic drivers
-pub mod keyboard;
-pub mod vga;
-pub mod ata;
-
-// Advanced drivers
-pub mod pci;      // PCI bus enumeration
-pub mod usb;      // USB stack (XHCI, HID)
-pub mod sdr;      // Software Defined Radio (RTL-SDR, demodulation)
-
-/// Initialize all device drivers
-pub fn init_all() {
-    // Basic I/O
-    keyboard::init();
-    vga::init();
-    ata::init();
-    
-    // Advanced peripherals
-    pci::init();
-    let _ = usb::init();  // May fail if no USB controllers
-    let _ = sdr::init();  // May fail if no SDR devices
-}
+pub mod virtio_blk;
+pub mod virtio_gpu;
+pub mod mouse;
+pub mod ps2;
+pub mod usb;
+pub mod pty;

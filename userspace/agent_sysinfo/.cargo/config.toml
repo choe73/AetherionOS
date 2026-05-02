@@ -1,0 +1,6 @@
+# AetherionOS Agent Build Configuration
+# Uses build-std for no_std environment. Linker.ld DISABLED (breaks .rodata).
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

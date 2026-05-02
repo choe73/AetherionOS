@@ -1,0 +1,68 @@
+digraph AetherionHAL {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor=lightblue, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    title [label="AETHERION OS - COUCHE 1 HAL\nv0.1.0-HAL", shape=none, fillcolor=white, fontsize=16, fontweight=bold];
+
+    subgraph cluster_boot {
+        label="Boot Layer";
+        style=dashed;
+        color=blue;
+
+        bootloader [label="Bootloader 0.9.23\n64-bit Long Mode", fillcolor=lightyellow];
+        bootinfo [label="BootInfo\nMemory Map", fillcolor=lightyellow];
+    }
+
+    subgraph cluster_hal {
+        label="HAL Core";
+        style=dashed;
+        color=green;
+
+        gdt [label="GDT\nGlobal Descriptor Table\nCode/Data Segments", fillcolor=lightgreen];
+        idt [label="IDT\nInterrupt Descriptor Table\nException Handlers", fillcolor=lightgreen];
+        memory [label="Memory Manager\nFrame Allocator\n32768 frames (128MB)", fillcolor=lightgreen];
+    }
+
+    subgraph cluster_security {
+        label="Security Layer";
+        style=dashed;
+        color=red;
+
+        tpm [label="TPM Detection\nACPI Parser\nv2.0 Detection", fillcolor=lightsalmon];
+        pcr [label="PCR Measurement\nSHA-256 Hash\nKernel Integrity", fillcolor=lightsalmon];
+    }
+
+    subgraph cluster_tests {
+        label="Test Suite (5/5 PASS)";
+        style=dashed;
+        color=purple;
+
+        test_gdt [label="test_gdt_load", shape=ellipse, fillcolor=plum];
+        test_idt [label="test_idt_load", shape=ellipse, fillcolor=plum];
+        test_timer [label="test_timer", shape=ellipse, fillcolor=plum];
+        test_mem [label="test_memory", shape=ellipse, fillcolor=plum];
+        test_tpm [label="test_tpm", shape=ellipse, fillcolor=plum];
+    }
+
+    // Connections
+    bootloader -> bootinfo;
+    bootloader -> gdt [label="init"];
+    bootloader -> idt [label="init"];
+    bootloader -> memory [label="provides map"];
+
+    gdt -> test_gdt [style=dashed, color=gray];
+    idt -> test_idt [style=dashed, color=gray];
+    idt -> test_timer [style=dashed, color=gray];
+    memory -> test_mem [style=dashed, color=gray];
+
+    gdt -> tpm [ltail=cluster_hal, lhead=cluster_security];
+    tpm -> pcr;
+    tpm -> test_tpm [style=dashed, color=gray];
+
+    // Metrics
+    metrics [label="Performance:\nBoot < 500ms\nIRQ < 10µs\nRAM < 1MB\nBuild < 300s", shape=note, fillcolor=white];
+
+    // Legend
+    legend [label="Legend:\n■ Boot  ■ HAL  ■ Security  ● Tests", shape=none, fillcolor=white];
+}

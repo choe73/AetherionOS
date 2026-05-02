@@ -1,323 +1,256 @@
-// Aetherion OS - Page Mapper
-// Phase 1.2: Virtual memory mapping with 4-level paging
+// memory/paging.rs - Page Table Manager avec Offset Mapping
+// Simplifié: pas de recursive mapping, utilise l'offset physique direct
 
-use super::{PhysicalAddress, VirtualAddress, PAGE_SIZE};
-use super::page_table::{PageTable, PageTableEntry, PageTableFlags};
-use super::frame_allocator::FrameAllocator;
+use super::MemoryError;
+use x86_64::structures::paging::{
+    PageTable, PageTableFlags, OffsetPageTable,
+    Page, PhysFrame, Size4KiB, Translate,
+};
+use x86_64::{VirtAddr, PhysAddr};
+use x86_64::registers::control::Cr3;
 
-/// Errors that can occur during page mapping
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MapperError {
-    /// Out of physical memory frames
-    OutOfMemory,
-    /// Page is already mapped
-    PageAlreadyMapped,
-    /// Invalid address (not aligned, out of range, etc.)
-    InvalidAddress,
-    /// Page table creation failed
-    TableCreationFailed,
-}
-
-/// Page Mapper - Manages virtual to physical address translation
+/// Gestionnaire de tables de pages avec offset mapping
 /// 
-/// Uses 4-level paging: PML4 → PDPT → PD → PT
-pub struct PageMapper {
-    pml4_address: PhysicalAddress,
+/// L'offset mapping permet d'accéder à la mémoire physique via:
+/// `phys_addr = virt_addr - physical_memory_offset`
+pub struct OffsetPageTableManager {
+    /// Mapper de x86_64 crate (offset-based)
+    mapper: OffsetPageTable<'static>,
+    /// Offset pour accès mémoire physique
+    physical_memory_offset: VirtAddr,
 }
 
-impl PageMapper {
-    /// Create a new PageMapper with existing PML4 table
-    /// 
-    /// # Arguments
-    /// * `pml4_addr` - Physical address of the PML4 table
+impl OffsetPageTableManager {
+    /// Crée un nouveau PageTableManager avec offset mapping
     /// 
     /// # Safety
-    /// The PML4 table must be valid and properly initialized
-    pub unsafe fn new(pml4_addr: PhysicalAddress) -> Self {
-        PageMapper {
-            pml4_address: pml4_addr,
+    /// - L'offset doit correspondre à l'offset utilisé par le bootloader
+    /// - Doit être appelé une seule fois
+    pub unsafe fn new(physical_memory_offset: VirtAddr) -> Self {
+        // Lire la table P4 actuelle depuis CR3
+        let (level_4_table_frame, _) = Cr3::read();
+        
+        // Calculer l'adresse virtuelle de la P4 via l'offset
+        let phys = level_4_table_frame.start_address();
+        let virt = physical_memory_offset + phys.as_u64();
+        
+        // SAFETY: The physical memory offset from bootloader maps all physical
+        // memory starting at this virtual address. CR3 contains the physical address
+        // of the active P4 table. Adding the offset gives its virtual address.
+        // The resulting pointer is valid for the lifetime of the kernel.
+        let page_table = &mut *(virt.as_mut_ptr::<PageTable>());
+        
+        // Créer l'OffsetPageTable
+        let mapper = OffsetPageTable::new(page_table, physical_memory_offset);
+        
+        Self {
+            mapper,
+            physical_memory_offset,
         }
     }
-
-    /// Get reference to PML4 table
-    unsafe fn pml4(&self) -> &'static PageTable {
-        &*(self.pml4_address.as_usize() as *const PageTable)
+    
+    /// Vérifie si une page est déjà mappée
+    fn is_page_mapped(&self, page: Page<Size4KiB>) -> bool {
+        use x86_64::structures::paging::mapper::TranslateResult;
+        matches!(
+            self.mapper.translate(page.start_address()),
+            TranslateResult::Mapped { .. }
+        )
     }
-
-    /// Get mutable reference to PML4 table
-    unsafe fn pml4_mut(&mut self) -> &'static mut PageTable {
-        &mut *(self.pml4_address.as_usize() as *mut PageTable)
-    }
-
-    /// Map a virtual page to a physical frame
+    
+    /// Mappe une page virtuelle vers une frame physique
     /// 
     /// # Arguments
-    /// * `virt_addr` - Virtual address to map
-    /// * `phys_addr` - Physical address to map to
-    /// * `flags` - Page table entry flags
-    /// * `allocator` - Frame allocator for creating new page tables
+    /// * `page` - La page virtuelle à mapper
+    /// * `frame` - La frame physique cible
+    /// * `flags` - Les flags (PRESENT, WRITABLE, etc.)
+    /// * `frame_allocator` - Frame allocator pour créer les tables intermédiaires si nécessaire
     /// 
-    /// # Returns
-    /// Ok(()) if mapping succeeded, Err(MapperError) otherwise
+    /// # Errors
+    /// Retourne une erreur si la page est déjà mappée ou si l'allocation de table échoue
+    /// 
+    /// # Safety
+    /// Cette fonction est unsafe car elle modifie les tables de pages actives.
     pub fn map_page(
         &mut self,
-        virt_addr: VirtualAddress,
-        phys_addr: PhysicalAddress,
-        flags: u64,
-        allocator: &mut FrameAllocator,
-    ) -> Result<(), MapperError> {
-        // Ensure addresses are page-aligned
-        if !virt_addr.is_aligned(PAGE_SIZE) || !phys_addr.is_aligned(PAGE_SIZE) {
-            return Err(MapperError::InvalidAddress);
-        }
-
-        unsafe {
-            // Get or create PDPT (Page Directory Pointer Table)
-            let pml4 = self.pml4_mut();
-            let pml4_index = virt_addr.pml4_index();
-            let pdpt = self.get_or_create_table(
-                &mut pml4[pml4_index],
-                allocator,
-            )?;
-
-            // Get or create PD (Page Directory)
-            let pdpt_index = virt_addr.pdpt_index();
-            let pd = self.get_or_create_table(
-                &mut pdpt[pdpt_index],
-                allocator,
-            )?;
-
-            // Get or create PT (Page Table)
-            let pd_index = virt_addr.pd_index();
-            let pt = self.get_or_create_table(
-                &mut pd[pd_index],
-                allocator,
-            )?;
-
-            // Map the page
-            let pt_index = virt_addr.pt_index();
-            let entry = &mut pt[pt_index];
-
-            if entry.is_present() {
-                return Err(MapperError::PageAlreadyMapped);
+        page: Page<Size4KiB>,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
+    ) -> Result<(), MemoryError> {
+        use x86_64::structures::paging::mapper::Mapper;
+        
+        // SAFETY: page, frame, and flags are validated by caller. The frame comes
+        // from FrameAllocator (unique, non-overlapping). frame_allocator may be used
+        // to allocate intermediate page table frames (P3/P2/P1). The resulting
+        // mapping is flushed from TLB immediately after creation.
+        let result = unsafe {
+            self.mapper.map_to(page, frame, flags, frame_allocator)
+        };
+        
+        match result {
+            Ok(flusher) => {
+                flusher.flush();
+                Ok(())
             }
-
-            // Set the entry with physical address and flags
-            entry.set_address(phys_addr, flags);
-
-            // Invalidate TLB entry for this page
-            Self::flush_tlb(virt_addr);
-
-            Ok(())
+            Err(_) => Err(MemoryError::OutOfMemory),
         }
     }
-
-    /// Unmap a virtual page
-    /// 
-    /// # Arguments
-    /// * `virt_addr` - Virtual address to unmap
-    /// 
-    /// # Returns
-    /// Ok(PhysicalAddress) of the unmapped frame, or Err(MapperError)
+    
+    /// Identity map: page virtuelle = adresse physique
+    /// Utile pour mapper la mémoire basse (0-4MB)
+    pub fn identity_map(
+        &mut self,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
+    ) -> Result<Page<Size4KiB>, MemoryError> {
+        let page = Page::containing_address(VirtAddr::new(frame.start_address().as_u64()));
+        self.map_page(page, frame, flags, frame_allocator)?;
+        Ok(page)
+    }
+    
+    /// Démappe une page virtuelle
     pub fn unmap_page(
         &mut self,
-        virt_addr: VirtualAddress,
-    ) -> Result<PhysicalAddress, MapperError> {
-        if !virt_addr.is_aligned(PAGE_SIZE) {
-            return Err(MapperError::InvalidAddress);
-        }
-
-        unsafe {
-            let pml4 = self.pml4_mut();
-            let pml4_index = virt_addr.pml4_index();
-            
-            if !pml4[pml4_index].is_present() {
-                return Err(MapperError::InvalidAddress);
+        page: Page<Size4KiB>,
+    ) -> Result<PhysFrame, MemoryError> {
+        use x86_64::structures::paging::mapper::Mapper;
+        
+        match self.mapper.unmap(page) {
+            Ok((frame, flusher)) => {
+                flusher.flush();
+                Ok(frame)
             }
-
-            let pdpt_addr = pml4[pml4_index].physical_address();
-            let pdpt = &mut *(pdpt_addr.as_usize() as *mut PageTable);
-            let pdpt_index = virt_addr.pdpt_index();
-
-            if !pdpt[pdpt_index].is_present() {
-                return Err(MapperError::InvalidAddress);
-            }
-
-            let pd_addr = pdpt[pdpt_index].physical_address();
-            let pd = &mut *(pd_addr.as_usize() as *mut PageTable);
-            let pd_index = virt_addr.pd_index();
-
-            if !pd[pd_index].is_present() {
-                return Err(MapperError::InvalidAddress);
-            }
-
-            let pt_addr = pd[pd_index].physical_address();
-            let pt = &mut *(pt_addr.as_usize() as *mut PageTable);
-            let pt_index = virt_addr.pt_index();
-
-            let entry = &mut pt[pt_index];
-            if !entry.is_present() {
-                return Err(MapperError::InvalidAddress);
-            }
-
-            let phys_addr = entry.physical_address();
-            entry.clear();
-
-            // Invalidate TLB
-            Self::flush_tlb(virt_addr);
-
-            Ok(phys_addr)
+            Err(_) => Err(MemoryError::PageNotMapped(page.start_address().as_u64())),
         }
     }
-
-    /// Translate a virtual address to physical address
-    /// 
-    /// # Returns
-    /// Some(PhysicalAddress) if mapped, None if not mapped
-    pub fn translate(&self, virt_addr: VirtualAddress) -> Option<PhysicalAddress> {
-        unsafe {
-            let pml4 = self.pml4();
-            let pml4_entry = &pml4[virt_addr.pml4_index()];
-            if !pml4_entry.is_present() {
-                return None;
-            }
-
-            let pdpt = &*(pml4_entry.physical_address().as_usize() as *const PageTable);
-            let pdpt_entry = &pdpt[virt_addr.pdpt_index()];
-            if !pdpt_entry.is_present() {
-                return None;
-            }
-
-            let pd = &*(pdpt_entry.physical_address().as_usize() as *const PageTable);
-            let pd_entry = &pd[virt_addr.pd_index()];
-            if !pd_entry.is_present() {
-                return None;
-            }
-
-            let pt = &*(pd_entry.physical_address().as_usize() as *const PageTable);
-            let pt_entry = &pt[virt_addr.pt_index()];
-            if !pt_entry.is_present() {
-                return None;
-            }
-
-            let frame_addr = pt_entry.physical_address();
-            let offset = virt_addr.page_offset();
-            Some(PhysicalAddress::new(frame_addr.as_usize() + offset))
-        }
+    
+    /// Traduit une adresse virtuelle en adresse physique
+    pub fn translate(&self, addr: VirtAddr) -> Option<PhysAddr> {
+        self.mapper.translate_addr(addr)
     }
-
-    /// Identity map a range of pages (virtual address = physical address)
-    /// 
-    /// # Arguments
-    /// * `start` - Start physical address
-    /// * `size` - Size in bytes
-    /// * `flags` - Page flags
-    /// * `allocator` - Frame allocator
-    pub fn identity_map_range(
+    
+    /// Traduit une page entière
+    pub fn translate_page(&self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
+        self.mapper.translate_addr(page.start_address())
+            .map(PhysFrame::containing_address)
+    }
+    
+    /// Mappe une région mémoire avec identity mapping
+    /// Utile pour mapper la mémoire kernel
+    pub fn identity_map_region(
         &mut self,
-        start: PhysicalAddress,
-        size: usize,
-        flags: u64,
-        allocator: &mut FrameAllocator,
-    ) -> Result<(), MapperError> {
-        let start_aligned = start.align_down(PAGE_SIZE);
-        let end = PhysicalAddress::new(start.as_usize() + size);
-        let end_aligned = end.align_up(PAGE_SIZE);
-
-        let mut current = start_aligned;
-        while current.as_usize() < end_aligned.as_usize() {
-            let virt = VirtualAddress::new(current.as_usize());
-            self.map_page(virt, current, flags, allocator)?;
-            current = PhysicalAddress::new(current.as_usize() + PAGE_SIZE);
+        start: PhysAddr,
+        end: PhysAddr,
+        flags: PageTableFlags,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
+    ) -> Result<(), MemoryError> {
+        let start_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(start);
+        let end_addr = end.as_u64().saturating_sub(1);
+        let end_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(end_addr));
+        
+        // Range manuel
+        let mut current_addr = start_frame.start_address().as_u64();
+        let end_addr = end_frame.start_address().as_u64();
+        
+        while current_addr <= end_addr {
+            let frame = PhysFrame::containing_address(PhysAddr::new(current_addr));
+            self.identity_map(frame, flags, frame_allocator)?;
+            current_addr += 4096;
         }
-
+        
         Ok(())
     }
-
-    /// Get or create a page table at the given entry
-    /// 
-    /// If entry is present, return existing table
-    /// If not, allocate new frame and create table
-    unsafe fn get_or_create_table(
+    
+    /// Change les flags d'une page existante
+    pub fn update_flags(
         &mut self,
-        entry: &mut PageTableEntry,
-        allocator: &mut FrameAllocator,
-    ) -> Result<&'static mut PageTable, MapperError> {
-        if entry.is_present() {
-            // Table already exists
-            let addr = entry.physical_address();
-            Ok(&mut *(addr.as_usize() as *mut PageTable))
-        } else {
-            // Create new table
-            let frame = allocator
-                .allocate_frame()
-                .ok_or(MapperError::OutOfMemory)?;
-
-            // Set entry to point to new table
-            let flags = PageTableFlags::PRESENT as u64 
-                      | PageTableFlags::WRITABLE as u64;
-            entry.set_address(frame, flags);
-
-            // Zero out the new table
-            let table = &mut *(frame.as_usize() as *mut PageTable);
-            table.zero();
-
-            Ok(table)
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), MemoryError> {
+        use x86_64::structures::paging::mapper::Mapper;
+        
+        // SAFETY: The page must be currently mapped (checked by the mapper).
+        // Updating flags does not change the physical frame backing, only the
+        // permission bits. The TLB is flushed after the update.
+        match unsafe { self.mapper.update_flags(page, flags) } {
+            Ok(flusher) => {
+                flusher.flush();
+                Ok(())
+            }
+            Err(_) => Err(MemoryError::PageNotMapped(page.start_address().as_u64())),
         }
     }
-
-    /// Flush TLB entry for a virtual address
-    fn flush_tlb(virt_addr: VirtualAddress) {
-        unsafe {
-            core::arch::asm!(
-                "invlpg [{}]",
-                in(reg) virt_addr.as_usize(),
-                options(nostack, preserves_flags)
-            );
-        }
+    
+    /// Accès à l'offset mémoire physique
+    pub fn physical_memory_offset(&self) -> VirtAddr {
+        self.physical_memory_offset
     }
-
-    /// Flush entire TLB by reloading CR3
-    pub fn flush_tlb_all(&self) {
-        unsafe {
-            core::arch::asm!(
-                "mov rax, cr3",
-                "mov cr3, rax",
-                out("rax") _,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    /// Get PML4 physical address
-    pub fn pml4_address(&self) -> PhysicalAddress {
-        self.pml4_address
+    
+    /// Convertit adresse physique en virtuelle via offset
+    pub fn phys_to_virt(&self, phys: PhysAddr) -> VirtAddr {
+        self.physical_memory_offset + phys.as_u64()
     }
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
+// Note: NullAllocator supprimé car il empêchait la création de tables intermédiaires
+// Le vrai FrameAllocator de frame.rs implémente maintenant x86_64::structures::paging::FrameAllocator
+// Ce qui permet à OffsetPageTable::map_to() d'allouer des frames pour les tables P3/P2/P1 si nécessaire
 
+/// Flags de page couramment utilisés
+pub mod flags {
+    use x86_64::structures::paging::PageTableFlags;
+    
+    /// Page présente
+    pub const PRESENT: PageTableFlags = PageTableFlags::PRESENT;
+    /// Page writable
+    pub const WRITABLE: PageTableFlags = PageTableFlags::WRITABLE;
+    /// Page accessible en user mode
+    pub const USER_ACCESSIBLE: PageTableFlags = PageTableFlags::USER_ACCESSIBLE;
+    /// Write-through caching
+    pub const WRITE_THROUGH: PageTableFlags = PageTableFlags::WRITE_THROUGH;
+    /// Disable cache
+    pub const NO_CACHE: PageTableFlags = PageTableFlags::NO_CACHE;
+    /// Page accessible seulement quand CR0.AC = 0
+    pub const ACCESSED: PageTableFlags = PageTableFlags::ACCESSED;
+    /// Page modifiée
+    pub const DIRTY: PageTableFlags = PageTableFlags::DIRTY;
+    /// Huge page (pas pour Size4KiB)
+    pub const HUGE_PAGE: PageTableFlags = PageTableFlags::HUGE_PAGE;
+    /// Global (TLB pas flush sur context switch)
+    pub const GLOBAL: PageTableFlags = PageTableFlags::GLOBAL;
+    /// No-execute (NX bit)
+    pub const NO_EXECUTE: PageTableFlags = PageTableFlags::NO_EXECUTE;
+    
+    /// Combinaisons courantes
+    pub const KERNEL_CODE: PageTableFlags = PRESENT;
+    pub const KERNEL_DATA: PageTableFlags = PRESENT.union(WRITABLE);
+    pub const KERNEL_RO: PageTableFlags = PRESENT;
+    pub const USER_CODE: PageTableFlags = PRESENT.union(USER_ACCESSIBLE);
+    pub const USER_DATA: PageTableFlags = PRESENT.union(WRITABLE).union(USER_ACCESSIBLE);
+}
+
+/// Tests unitaires
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Note: These tests require a working frame allocator
-    // They should be run after frame allocator is initialized
-
-    #[test]
-    fn test_mapper_error_types() {
-        assert_eq!(MapperError::OutOfMemory, MapperError::OutOfMemory);
-        assert_ne!(MapperError::OutOfMemory, MapperError::PageAlreadyMapped);
+    use super::super::frame::FrameAllocator;
+    
+    // Note: Les tests de paging nécessitent un environnement de boot complet
+    // Ces tests sont des stubs qui vérifient la compilation
+    
+    #[test_case]
+    fn test_paging_module_compiles() {
+        assert_eq!(1 + 1, 2);
     }
-
-    #[test]
-    fn test_pml4_address() {
-        let addr = PhysicalAddress::new(0x1000);
-        unsafe {
-            let mapper = PageMapper::new(addr);
-            assert_eq!(mapper.pml4_address().as_usize(), 0x1000);
-        }
+    
+    #[test_case]
+    fn test_page_flags() {
+        use x86_64::structures::paging::PageTableFlags;
+        
+        let flags = flags::KERNEL_DATA;
+        assert!(flags.contains(PageTableFlags::PRESENT));
+        assert!(flags.contains(PageTableFlags::WRITABLE));
     }
 }

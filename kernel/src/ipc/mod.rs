@@ -1,92 +1,196 @@
-// Aetherion OS - Inter-Process Communication
-// Phase 2.4: IPC mechanisms
+// ipc/mod.rs - Cognitive Bus (Inter-Process Communication)
+// Couche 3: Architecture Intent-Based pour ACHA-OS
+//
+// Le Cognitive Bus est le systeme nerveux d'AetherionOS.
+// Il fournit une file de messages typee "Intent-Based" pour la
+// communication entre les differents modules du noyau.
+//
+// Architecture:
+//   - Lock-free MPMC (Multi-Producer Multi-Consumer)
+//   - Messages types avec ComponentId et Priority
+//   - Zero-copy message passing avec O(1) publish/consume
 
-use crate::process::Pid;
-use alloc::vec::Vec;
-use spin::Mutex;
+pub mod bus;
 
-/// Message for IPC
-#[derive(Clone)]
-pub struct Message {
-    sender: Pid,
-    data: Vec<u8>,
+use core::fmt;
+
+// ===== Component Identifiers =====
+
+/// Identifiant des composants du noyau ACHA
+/// Chaque module du kernel est identifie par un ComponentId unique
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum ComponentId {
+    /// Orchestrateur central (destination par defaut)
+    Orchestrator = 0,
+    /// Hardware Abstraction Layer (Couche 1)
+    HAL = 1,
+    /// Memory Manager (Couche 2)
+    Memory = 2,
+    /// Verifier / Security module
+    Verifier = 3,
+    /// Cerebellum (ML/AI subsystem)
+    Cerebellum = 4,
+    /// Filesystem (VFS)
+    Filesystem = 5,
+    /// Network stack
+    Network = 6,
+    /// Security subsystem
+    Security = 7,
+    /// Worker agent (user-space)
+    Worker = 8,
+    /// Broadcast (tous les composants)
+    Broadcast = 0xFF,
 }
 
-impl Message {
-    pub fn new(sender: Pid, data: Vec<u8>) -> Self {
-        Message { sender, data }
-    }
-    
-    pub fn sender(&self) -> Pid {
-        self.sender
-    }
-    
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-/// Message queue for a process
-struct MessageQueue {
-    messages: Vec<Message>,
-    capacity: usize,
-}
-
-impl MessageQueue {
-    fn new(capacity: usize) -> Self {
-        MessageQueue {
-            messages: Vec::with_capacity(capacity),
-            capacity,
+impl fmt::Display for ComponentId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Orchestrator => write!(f, "Orchestrator"),
+            Self::HAL => write!(f, "HAL"),
+            Self::Memory => write!(f, "Memory"),
+            Self::Verifier => write!(f, "Verifier"),
+            Self::Cerebellum => write!(f, "Cerebellum"),
+            Self::Filesystem => write!(f, "Filesystem"),
+            Self::Network => write!(f, "Network"),
+            Self::Security => write!(f, "Security"),
+            Self::Worker => write!(f, "Worker"),
+            Self::Broadcast => write!(f, "Broadcast"),
         }
     }
-    
-    fn send(&mut self, msg: Message) -> Result<(), &'static str> {
-        if self.messages.len() >= self.capacity {
-            return Err("Queue full");
+}
+
+// ===== Priority Levels =====
+
+/// Niveaux de priorite des messages
+/// L'Orchestrateur peut utiliser la priorite pour trier les messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Priority {
+    /// Priorite basse - taches de fond
+    Low = 0,
+    /// Priorite normale - operations courantes
+    Normal = 64,
+    /// Priorite haute - evenements importants
+    High = 128,
+    /// Priorite critique - interruptions, paniques
+    Critical = 255,
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Low => write!(f, "LOW"),
+            Self::Normal => write!(f, "NORMAL"),
+            Self::High => write!(f, "HIGH"),
+            Self::Critical => write!(f, "CRITICAL"),
         }
-        self.messages.push(msg);
-        Ok(())
     }
-    
-    fn receive(&mut self) -> Option<Message> {
-        if self.messages.is_empty() {
-            None
-        } else {
-            Some(self.messages.remove(0))
+}
+
+// ===== Intent Message =====
+
+/// Structure de message Intent-Based pour le Cognitive Bus
+///
+/// Chaque message represente une "intention" d'un composant vers un autre.
+/// Le champ `intent_id` encode l'action demandee (ex: 0x0001 = KeyPress,
+/// 0x0010 = AllocRequest, 0x0020 = VerifyIntegrity, etc.)
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct IntentMessage {
+    /// Composant emetteur du message
+    pub source: ComponentId,
+    /// Composant destinataire (Orchestrator = hub central)
+    pub destination: ComponentId,
+    /// Code de l'action/intention (semantique libre par composant)
+    pub intent_id: u32,
+    /// Niveau de priorite du message
+    pub priority: Priority,
+    /// Donnee associee (valeur directe ou pointeur)
+    pub payload: u64,
+    /// Timestamp TSC pour tracabilite et benchmarks
+    pub timestamp: u64,
+    /// Jalon 109: Session ID for multi-agent session tracking
+    /// 0 = no session (legacy / system messages)
+    pub session_id: u64,
+    /// Jalon 109: Correlation ID for request/response chaining
+    /// Allows tracing a request through multiple agents
+    pub correlation_id: u64,
+}
+
+impl IntentMessage {
+    /// Cree un nouveau message avec timestamp automatique (TSC)
+    /// Legacy constructor: session_id=0, correlation_id=0
+    pub fn new(
+        source: ComponentId,
+        destination: ComponentId,
+        intent_id: u32,
+        priority: Priority,
+        payload: u64,
+    ) -> Self {
+        Self {
+            source,
+            destination,
+            intent_id,
+            priority,
+            payload,
+            timestamp: crate::arch::x86_64::timer::read_tsc(),
+            session_id: 0,
+            correlation_id: 0,
+        }
+    }
+
+    /// Jalon 109: Extended constructor with Session & Correlation IDs
+    pub fn new_ext(
+        source: ComponentId,
+        destination: ComponentId,
+        intent_id: u32,
+        priority: Priority,
+        payload: u64,
+        session_id: u64,
+        correlation_id: u64,
+    ) -> Self {
+        Self {
+            source,
+            destination,
+            intent_id,
+            priority,
+            payload,
+            timestamp: crate::arch::x86_64::timer::read_tsc(),
+            session_id,
+            correlation_id,
         }
     }
 }
 
-/// Global IPC system
-static IPC_QUEUES: Mutex<[Option<MessageQueue>; 256]> = Mutex::new([const { None }; 256]);
-
-/// Initialize IPC for a process
-pub fn init_process_queue(pid: Pid, capacity: usize) {
-    let mut queues = IPC_QUEUES.lock();
-    let index = pid.as_usize() % 256;
-    queues[index] = Some(MessageQueue::new(capacity));
-}
-
-/// Send a message to a process
-pub fn send(to: Pid, from: Pid, data: Vec<u8>) -> Result<(), &'static str> {
-    let msg = Message::new(from, data);
-    let mut queues = IPC_QUEUES.lock();
-    let index = to.as_usize() % 256;
-    
-    match queues[index].as_mut() {
-        Some(queue) => queue.send(msg),
-        None => Err("No queue for recipient"),
+impl fmt::Display for IntentMessage {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "[{} -> {}] Intent=0x{:04x} Priority={} Payload=0x{:016x} Session={} Corr={}",
+            self.source, self.destination, self.intent_id, self.priority, self.payload,
+            self.session_id, self.correlation_id
+        )
     }
 }
 
-/// Receive a message
-pub fn receive(pid: Pid) -> Option<Message> {
-    let mut queues = IPC_QUEUES.lock();
-    let index = pid.as_usize() % 256;
-    
-    queues[index].as_mut()?.receive()
+// ===== Bus Errors =====
+
+/// Erreurs possibles lors des operations sur le bus
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusError {
+    /// La file est pleine, impossible de publier
+    QueueFull,
+    /// La file est vide, rien a consommer
+    QueueEmpty,
 }
 
-pub fn init() {
-    // IPC system initialized
+impl fmt::Display for BusError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "Bus queue is full"),
+            Self::QueueEmpty => write!(f, "Bus queue is empty"),
+        }
+    }
 }
